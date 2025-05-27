@@ -482,7 +482,7 @@ class MultiHeadCritic(nn.Module):
 
 
 class MarCog(nn.Module):
-    def __init__(self, repo: str = "./models/Qwen2.5-Coder-32B-Instruct", n_agents: int = N_AGENTS):
+    def __init__(self, repo: str = "Qwen/Qwen2.5-Coder-32B-Instruct", n_agents: int = N_AGENTS):
         super().__init__()
         bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16)
         base = AutoModelForCausalLM.from_pretrained(repo, device_map="auto" if torch.cuda.is_available() else None,

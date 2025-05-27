@@ -1,5 +1,11 @@
 # shppo_emergent.py
+
 from __future__ import annotations
+
+import os
+# Ensure Triton autotune cache directory exists to suppress warnings
+autotune_dir = os.path.expanduser("~/.triton/autotune")
+os.makedirs(autotune_dir, exist_ok=True)
 
 # ────────────────────────────────────── stdlib ─────────────────────────────────────
 import itertools
@@ -15,8 +21,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import math
 import textwrap
 
-# ─────────────────────────────────── third-party ───────────────────────────────────
 import numpy as np
+import pandas as pd
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -31,13 +38,52 @@ from transformers import (
 )
 from peft import get_peft_model, LoraConfig
 import re
+from accelerate import Accelerator
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    filename="morcog.log",
+    filemode="a",
+    format="%(asctime)s %(levelname)s: %(message)s"
+)
+# Suppress verbose Hugging Face and HTTP client logs
+logging.getLogger("transformers").setLevel(logging.WARNING)
+logging.getLogger("datasets").setLevel(logging.WARNING)
+logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("s3transfer").setLevel(logging.WARNING)
+class VecEnv:
+    """
+    Simple vectorized wrapper for CodeGenEnv to run multiple environments in parallel.
+    """
+    def __init__(self, env_fns: list[callable]):
+        self.envs = [fn() for fn in env_fns]
+        self.num_envs = len(self.envs)
+        self.n_agents = self.envs[0].n_agents
+
+    def reset(self):
+        # Returns obs: (num_envs, n_agents, obs_dim), globs: (num_envs, glob_dim)
+        obs_list, glob_list = zip(*(env.reset() for env in self.envs))
+        return np.stack(obs_list), np.stack(glob_list)
+
+    def step(self, actions: np.ndarray):
+        # actions: array of shape (num_envs, n_agents)
+        results = [env.step(a) for env, a in zip(self.envs, actions)]
+        obs_list, glob_list, rew_list, done_list, out_list = zip(*results)
+        return (
+            np.stack(obs_list),
+            np.stack(glob_list),
+            np.stack(rew_list),
+            np.stack(done_list),
+            list(out_list),
+        )
 
 warnings.filterwarnings("ignore", category=UserWarning, module="bitsandbytes")
 
 # ───────────────────────────────── configuration ───────────────────────────────────
 OBS_DIM = 256
 GLOB_DIM = 256
-N_AGENTS = 5 # Default number of agents for training
+N_AGENTS = 3 # Default number of agents for training
 MAX_STEPS = 20
 RNN_HIDDEN_SIZE = 64
 LATENT_Z_DIM = 3
@@ -46,7 +92,7 @@ HET_LAYER_OUT_DIM = 128
 ACTION_TEMPLATES: Tuple[str, ...] = (
     "plan-subgoal",        
     "rephrase-prompt",     
-    "improve-subgoals",     
+    "assess-subgoals",     
 
     "generate-code",       
     "optimize-code",       
@@ -63,7 +109,7 @@ ACTION_TO_IDX = {a: i for i, a in enumerate(ACTION_TEMPLATES)}
 PLANNER_ACTIONS = {
     ACTION_TO_IDX["plan-subgoal"],
     ACTION_TO_IDX["rephrase-prompt"],
-    ACTION_TO_IDX["improve-subgoals"],
+    ACTION_TO_IDX["assess-subgoals"],
 }
 
 CODE_ACTIONS = {
@@ -86,7 +132,6 @@ def cosine_dist(x: torch.Tensor) -> torch.Tensor:
     n = x.size(0)
     if n <= 1:
         return torch.tensor(0.0, device=x.device)
-    # Calculate mean of 1 - cosine similarity for all pairs (excluding self-similarity)
     mask = ~torch.eye(n, dtype=torch.bool, device=x.device)
     return (1 - sim[mask]).mean()
 
@@ -94,68 +139,134 @@ def cosine_dist(x: torch.Tensor) -> torch.Tensor:
 # 1. Dataset loader ------------------------------------------------------------
 # ==============================================================================
 class CodeContestDataset:
+    _cache: Dict[str, List[Dict[str, Any]]] = {}
+
     def __init__(self, split: str = "train") -> None:
-        # Load dataset, trust remote code is necessary
+        if split in CodeContestDataset._cache:
+            self.tasks = CodeContestDataset._cache[split]
+            return
         ds = load_dataset("deepmind/code_contests", split=split, trust_remote_code=True)
-        self.tasks: List[Dict[str, Any]] = []
-        # Iterate through dataset rows to extract task information
+        tasks: List[Dict[str, Any]] = []
         for row in ds:
-            # Extract public tests inputs and outputs
             ins, outs = row["public_tests"]["input"], row["public_tests"]["output"]
-            self.tasks.append({
-                "name": row["name"], # Task name
-                "prompt": row["description"], # Task description/prompt
-                "tests_public": list(zip(ins, outs)), # List of (input, output) pairs for public tests
-                # Embed the description to create observation features
-                "observation_features": self._embed(row["description"]), 
+            
+            tasks.append({
+                "name": row["name"],
+                "prompt": row["description"],
+                "tests_public": list(zip(ins, outs)),
+                "observation_features": self._embed(row["description"]),
             })
+        self.tasks = tasks
+        CodeContestDataset._cache[split] = tasks
 
     @staticmethod
     def _embed(text: str, dim: int = OBS_DIM) -> np.ndarray:
-        # Create a simple feature vector based on character frequency
         vec = np.zeros(dim, np.float32)
-        # Use first few characters to populate the vector
-        for ch in text[: dim * 4]: # Limit characters to process
-            # Simple hashing of character ordinal value
+        for ch in text[: dim * 4]: 
             vec[ord(ch) % dim] += 1
-        # Normalize the vector
         norm = np.linalg.norm(vec)
-        return vec / norm if norm else vec # Avoid division by zero
+        return vec / norm if norm else vec 
 
     def sample(self) -> Dict[str, Any]:
-        # Randomly sample a task from the loaded tasks
         return random.choice(self.tasks)
 
 # ==============================================================================
 # 2. Unsafe Python executor ---------------------------------------------------
 # ==============================================================================
 
-def extract_python_code(raw_output: str) -> str:
-    raw = raw_output.strip()
-    m = re.search(r"```python\s*\n(.*?)```", raw, re.DOTALL)
-    if m: return textwrap.dedent(m.group(1)).strip()
-    m = re.search(r"```\s*\n(.*?)```", raw, re.DOTALL)
-    if m: return textwrap.dedent(m.group(1)).strip()
-    lines = raw.splitlines()
-    for i, L in enumerate(lines):
-        if L.strip().startswith("def ") or "__main__" in L:
-            return textwrap.dedent("\n".join(lines[i:])).strip()
-    return textwrap.dedent(raw)
+def build_py_wrap(impl: str, fn_name: str) -> str:
+    return textwrap.dedent(f"""
+    {impl}
 
-def exec_solution(src: str, stdin: str, timeout: float = 2.0):
-    code = textwrap.dedent(src)
+    import sys
+    if __name__ == "__main__":
+        input_data = sys.stdin.read()
+        res = {fn_name}(input_data)
+        if not isinstance(res, str):
+            raise RuntimeError("Function must return a string")
+        sys.stdout.write(res)
+    """)
+
+
+def find_function_name(code: str) -> Optional[str]:
+
+    pattern = r"def\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\("
+    match = re.search(pattern, code)
+    return match.group(1) if match else None
+
+
+def exec_solution(src: str, stdin: Any, timeout: float = 2.0) -> Tuple[str, str]:
+    if not src.strip():
+        return "", "No code provided"
+
+    impl_block = src.strip()
+    fn_name = find_function_name(impl_block)
+    if not fn_name:
+        return "", "No valid function found"
+    
+    logging.info((
+        "&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&\n"
+        f"\nExecuting function: {fn_name}\n"
+        "Block Start"
+        f"\n{impl_block}\n"
+        "Block End\n"
+    ))
+    
+    wrapped = build_py_wrap(impl_block, fn_name)
+
+    if isinstance(stdin, (bytes, bytearray)):
+        input_str = stdin.decode("utf-8", errors="ignore")
+    else:
+        input_str = str(stdin)
+
     with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as tmp:
-        tmp.write(code); tmp.flush()
-        fn = tmp.name
+        tmp.write(wrapped)
+        tmp.flush()
+        filename = tmp.name
+
+    stdout, stderr = "", ""
     try:
         proc = subprocess.run(
-            ["python", fn],
-            input=stdin, text=True,
-            capture_output=True, timeout=timeout
+            ["python", filename],
+            input=input_str,
+            capture_output=True,
+            timeout=timeout,
+            text=True,
         )
-        return proc.stdout, proc.stderr
+        stdout, stderr = proc.stdout.strip(), proc.stderr.strip()
+    except subprocess.TimeoutExpired:
+        stderr = "TimeoutExpired"
+    except Exception as e:
+        stderr = f"Subprocess error: {e}"
     finally:
-        os.remove(fn)
+        os.remove(filename)
+
+    return stdout, stderr
+
+
+
+def extract_python_code(raw_output: str) -> str:
+    """
+    Extracts Python code from LLM output and dedents it for execution.
+    Handles code blocks, def/main detection, or returns fallback text.
+    """
+    raw_output = raw_output.strip()
+
+    match = re.search(r"```python\s*\n(.*?)```", raw_output, re.DOTALL)
+    if match:
+        return textwrap.dedent(match.group(1)).strip()
+
+    match = re.search(r"```\s*\n(.*?)```", raw_output, re.DOTALL)
+    if match:
+        return textwrap.dedent(match.group(1)).strip()
+
+    lines = raw_output.splitlines()
+    for i, line in enumerate(lines):
+        if "def " in line or "main(" in line:
+            return textwrap.dedent("\n".join(lines[i:])).strip()
+
+    # 4. fallback
+    return textwrap.dedent(raw_output)
 
 
 
@@ -166,9 +277,10 @@ class CodeGenEnv:
     def __init__(
         self,
         split: str = "train",
-        actor: ShppoAgent | None = None,
+        actor: MarCog | None = None,
         n_agents: int = N_AGENTS
     ) -> None:
+        self.split = split
         self.ds       = CodeContestDataset(split)
         self.n_agents = n_agents
         self.obs_dim, self.glob_dim = OBS_DIM, GLOB_DIM
@@ -182,7 +294,6 @@ class CodeGenEnv:
         self.last_error     = ""
         self.step_i         = 0
 
-        self.reset()
 
     @staticmethod
     def _embed(text: str, dim: int) -> np.ndarray:
@@ -197,18 +308,22 @@ class CodeGenEnv:
         self.last_error    = ""
         self.current_prompt = self.task["prompt"]
 
+        if self.actor:
+            self.actor.set_prompts([self.current_prompt] * self.n_agents)
+
         o0   = self._make_obs()
         obs  = np.stack([o0] * self.n_agents)
         glob = self._embed(self.task["name"], self.glob_dim)
-
-        if self.actor:
-            self.actor.set_prompts([self.current_prompt] * self.n_agents)
 
         return obs, glob
 
     def _make_obs(self) -> np.ndarray:
         q = self.obs_dim // 3
-        p = self._embed(self.current_prompt, q)
+        if self.actor and self.actor._pooled_features is not None:
+            # use base-model’s pooled prompt embedding, truncated to q
+            p = self.actor._pooled_features[0, :q].cpu().numpy()
+        else:
+            p = self._embed(self.current_prompt, q)
         c = self._embed(self.code, q)
         e = self._embed(self.last_error, self.obs_dim - 2*q)
         e[0] = self.pass_fraction
@@ -270,19 +385,19 @@ class CodeGenEnv:
                 output = raw
 
             elif tmpl in ("generate-code", "optimize-code"):
-                code = extract_python_code(raw)
-                if code.strip() and code.strip() != self.code:
-                    self.code = code.strip()
-                output = code or raw
+                cleaned = extract_python_code(raw)
+                if cleaned.strip() and cleaned.strip() != self.code:
+                    self.code = cleaned.strip()
+                output = cleaned or raw
 
             elif tmpl in ("self-review", "patch-bug", "unit-fix"):
                 if raw.startswith("# Skipped") or raw.startswith("# Cannot"):
                     output = raw
                 else:
-                    code = extract_python_code(raw)
-                    if code.strip() and code.strip() != self.code:
-                        self.code = code.strip()
-                    output = code or raw
+                    cleaned = extract_python_code(raw)
+                    if cleaned.strip() and cleaned.strip() != self.code:
+                        self.code = cleaned.strip()
+                    output = cleaned or raw
 
             else:  
                 output = raw
@@ -331,8 +446,6 @@ class CodeGenEnv:
                 reward_scalar += 0.01
             elif int(idx) in DEBUG_ACTIONS:
                 reward_scalar += 0.015
-        
-
         
         done  = (pf == 1.0) or (self.step_i >= self.max_steps)
         obs   = np.stack([self._make_obs()] * self.n_agents)
@@ -425,7 +538,8 @@ class MultiHeadCritic(nn.Module):
                     out = self.heads[i](h[mask]).squeeze(-1)  # (M,)
                     outputs.append((mask, out))
 
-            values = torch.zeros(B, device=glob.device)
+            # Initialize with same dtype as head outputs (e.g., bfloat16 under autocast)
+            values = torch.zeros(B, device=glob.device, dtype=h.dtype)
             for mask, out in outputs:
                 values[mask] = out
             return values  # shape: (B,)
@@ -433,22 +547,23 @@ class MultiHeadCritic(nn.Module):
             return torch.cat([head(h).unsqueeze(1) for head in self.heads], dim=1)
 
 
-class ShppoAgent(nn.Module):
-    def __init__(self, repo: str = "../models/Qwen2.5-Coder-32B-Instruct", n_agents: int = N_AGENTS):
+class MarCog(nn.Module):
+    def __init__(self, repo: str = "Qwen/Qwen2.5-Coder-32B-Instruct", n_agents: int = N_AGENTS):
         super().__init__()
         bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16)
-        base = AutoModelForCausalLM.from_pretrained(repo, device_map="auto" if torch.cuda.is_available() else None,
-                                                    quantization_config=bnb, trust_remote_code=True)
+        # Map this process to a single GPU so PEFT works on each rank
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        device_map = {"": local_rank} if torch.cuda.is_available() else None
+        base = AutoModelForCausalLM.from_pretrained(
+            repo,
+            device_map=device_map,
+            quantization_config=bnb,
+            trust_remote_code=True,
+            low_cpu_mem_usage=False
+        )
         self.tokenizer = AutoTokenizer.from_pretrained(repo, trust_remote_code=True)
         self.tokenizer.pad_token = self.tokenizer.eos_token
-        peft_cfg = LoraConfig(
-            task_type="CAUSAL_LM",
-            inference_mode=False,
-            r=32,              
-            lora_alpha=64,     
-            lora_dropout=0.05,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"] 
-        )
+        peft_cfg = LoraConfig(task_type="CAUSAL_LM", inference_mode=False, r=8, lora_alpha=16, lora_dropout=0.05)
         self.model = get_peft_model(base, peft_cfg)
 
         self.n_agents = n_agents
@@ -465,12 +580,24 @@ class ShppoAgent(nn.Module):
         return next(self.model.parameters()).device
 
     def set_prompts(self, prompts: List[str]):
-        prompts = prompts[: self.n_agents]
         if prompts == self._last_prompts:
             return
         self._last_prompts = prompts
+        
+        messages = []
+        for i, prompt in enumerate(prompts):
+            messages.append([
+                {"role": "system", "content": "You are a helpful code generation assistant."},
+                {"role": "user", "content": prompt}
+            ])
+        texts = self.tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+        
         toks = self.tokenizer(
-            prompts,
+            texts,
             return_tensors="pt",
             padding=True,
             truncation=True,
@@ -492,9 +619,11 @@ class ShppoAgent(nn.Module):
 
         pooled = self._pooled_features[agent_ids] 
         feat = torch.cat([pooled, obs, mem], dim=-1)
-        assert feat.shape[1] == self.decoder.hdim, f"Expected feat_dim={self.decoder.hdim}, got {feat.shape[1]}"
+        # Support DDP-wrapped decoder
+        dec = self.decoder.module if hasattr(self.decoder, "module") else self.decoder
+        assert feat.shape[1] == dec.hdim, f"Expected feat_dim={dec.hdim}, got {feat.shape[1]}"
 
-        W, b = self.decoder(z)  # (B, out, feat_dim)
+        W, b = self.decoder(z)  
         logits = torch.bmm(W, feat.unsqueeze(-1)).squeeze(-1) + b
         return Categorical(logits=logits)
 
@@ -509,68 +638,68 @@ class ShppoAgent(nn.Module):
         device: torch.device,
         action_template: str
     ) -> str:
+        # 2) 프롬프트 본문(body) 결정
         if action_template == "plan-subgoal":
             body = (
                 f"Task:\n{prompt}\n\n"
                 f"Previous plan:\n{prev_plan}\n\n"
                 f"Pass fraction: {pf*100:.1f}%\n"
-                f"Previous Code:\n{prev_code}\n\n"
                 f"Errors:\n{errs}\n\n"
                 f"Action: {action_template}\n"
-                "You have to plan-subgoal. Write a bullet-point list of subgoals to solve the task.\n"
-                "Output subgoals only, without explanation or commentary."
+                f"You have to {action_template}. Produce a sequence of bullet-point plan and subgoals.\n"
             )
 
         elif action_template == "rephrase-prompt":
             body = (
                 f"Original Prompt:\n{prompt}\n\n"
-                f"Previous Code:\n{prev_code}\n\n"
-                f"Errors:\n{errs}\n\n"
                 f"Action: {action_template}\n"
-                
-                "You have to rephrase-prompt. Rewrite the task description to be clearer and more precise.\n"
-                "Only output the rewritten task description. Do not include any explanation."
-
+                f"You have to {action_template}. Rewrite the task description to make it clearer and more precise.\n"
             )
 
-        elif action_template == "improve-subgoals":
+        elif action_template == "assess-subgoals":
             if not prev_plan.strip():
-                return "# Skipped improve-subgoals: no current plan available."
+                return "# Skipped assess-subgoals: no current plan available."
             body = (
                 f"Task:\n{prompt}\n\n"
                 f"Subgoal plan:\n{prev_plan}\n"
                 f"Pass fraction: {pf*100:.1f}%\n"
-                f"Previous Code:\n{prev_code}\n\n"
                 f"Errors:\n{errs}\n\n"
                 f"Action: {action_template}\n"
-                "You have to improve-subgoals. Assess whether the current subgoals are logical, complete, and well-structured.\n"
-                "Output only the improved subgoal. Do not include explanation."
+                f"You have to {action_template}. Evaluate whether the subgoals are logically valid, sufficient, and well-structured.\n"
+                "Suggest improvements if needed.\n"
             )
 
         elif action_template == "generate-code":
             body = (
                 f"Task:\n{prompt}\n\n"
                 f"Subgoal plan:\n{prev_plan}\n"
-                f"Previous Code:\n{prev_code}\n\n"
+                f"Pass fraction: {pf*100:.1f}%\n"
+                f"Errors:\n{errs}\n\n"
                 f"Action: {action_template}\n"
-                "Action: generate-code\n"
-                "Please write a complete Python script that solves the above task.\n"
-                "- Define a function that takes a single string argument (the full standard input).\n"
-                "- Wrap execution in `if __name__ == \"__main__\":`.\n"
-                "- Read input via `sys.stdin.read()`.\n"
-                "- Print the function output.\n"
-                "- No comments, no markdown—code only.\n"
-                )
+                f"You have to {action_template}. Implement a function with this format:\n"
+                "    def solve(input_data: str) -> str:\n"
+                "        \"\"\"\n"
+                "        input_data: the entire stdin as one string\n"
+                "        Returns: exactly what should be printed to stdout\n"
+                "        \"\"\"\n"
+                "        # parse input_data\n"
+                "        # compute answer\n"
+                "        # return result string\n\n"
+                "Requirements:\n"
+                "- Do NOT use input() or print() inside your function.\n"
+                "- Do NOT include any comments or extra text—only the function definition.\n"
+            )
 
         elif action_template == "optimize-code":
             if not prev_code.strip():
                 return "# Skipped optimize-code: no code to optimize."
             body = (
                 f"Task:\n{prompt}\n\n"
-                f"Previous Code:\n{prev_code}\n"
+                f"Subgoal plan:\n{prev_plan}\n"
+                f"Pass fraction: {pf*100:.1f}%\n"
+                f"Errors:\n{errs}\n\n"
                 f"Action: {action_template}\n"
-                "You have to optimize-code. Improve the time and space efficiency of the given code without changing its functionality.\n"
-                "Base your optimization on the task description and constraints.\n"
+                f"You have to {action_template}. Optimize the code to improve time and space complexity without changing its functionality.\n"
             )
 
         elif action_template == "self-review":
@@ -613,8 +742,58 @@ class ShppoAgent(nn.Module):
 
         else:
             raise ValueError(f"Unknown action_template: {action_template}")
+        
+        # Few-shot examples per action_template
+        examples_dict = {
+            "plan-subgoal": [
+                {"role": "user", "content": "Task:\nCompute factorial of a number\nAction: plan-subgoal\nOutline the steps in bullet points."},
+                {"role": "assistant", "content": "- Parse input integer\n- Initialize result to 1\n- Loop from 1 to N, multiply result\n- Return result as string"}
+            ],
+            "rephrase-prompt": [
+                {"role": "user", "content": "Original Prompt:\nAdd two numbers and print the sum.\nAction: rephrase-prompt\nRewrite it more clearly and formally."},
+                {"role": "assistant", "content": "Write a program that reads two integers from input and outputs their sum."}
+            ],
+            "assess-subgoals": [
+                {"role": "user", "content": "Task:\nCompute GCD of two numbers\nSubgoal plan:\n- Parse input\n- Apply Euclidean algorithm\nAction: assess-subgoals\nEvaluate the plan."},
+                {"role": "assistant", "content": "The plan is valid but missing a check for zero input as a base case. Consider adding that step."}
+            ],
+            "generate-code": [
+                {"role": "user", "content": "Task:\nReverse the input string\nAction: generate-code\nImplement solve function."},
+                {"role": "assistant", "content": "def solve(input_data: str) -> str:\n    return input_data[::-1]"}
+            ],
+            "optimize-code": [
+                {"role": "user", "content": "Task:\nSort a list of integers\nAction: optimize-code\nExisting solution uses bubble sort."},
+                {"role": "assistant", "content": "def solve(input_data: str) -> str:\n    nums = list(map(int, input_data.split()))\n    nums.sort()\n    return ' '.join(map(str, nums))"}
+            ],
+            "self-review": [
+                {"role": "user", "content": "Task:\nCompute factorial\nCode for review:\ndef solve(input_data: str) -> str:\n    n = int(input_data)\n    res = 1\n    for i in range(n):\n        res *= i\n    return str(res)\nAction: self-review\nIdentify issues."},
+                {"role": "assistant", "content": "The loop starts from 0, which will zero out the result. You should loop from 1 to n inclusive instead."}
+            ],
+            "patch-bug": [
+                {"role": "user", "content": "Task:\nAdd two numbers\nCode needing fix:\ndef solve(input_data: str) -> str:\n    a, b = input_data.split()\n    return str(int(a) - int(b))\nAction: patch-bug\nFix the subtraction error."},
+                {"role": "assistant", "content": "def solve(input_data: str) -> str:\n    a, b = input_data.split()\n    return str(int(a) + int(b))"}
+            ],
+            "unit-fix": [
+                {"role": "user", "content": "Task:\nMultiply two numbers\nFailing Code:\ndef solve(input_data: str) -> str:\n    a, b = map(int, input_data.split())\n    return str(a * b)\nTests:\nInput: '2 3', Expected: '6'\nAction: unit-fix\nFix if needed."},
+                {"role": "assistant", "content": "The code passes the test as is, no changes needed."}
+            ],
+            "noop": [
+                {"role": "user", "content": "Task:\nNo changes required\nAction: noop\nDo nothing."},
+                {"role": "assistant", "content": "# No operation selected. Skipping step."}
+            ]
+        }
+        few_shot_examples = examples_dict.get(action_template, [])
+        messages = few_shot_examples + [
+            {"role": "system", "content": "You are a helpful code generation assistant."},
+            {"role": "user", "content": body},
+        ]
+        text = self.tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=False,
+        )
         toks = self.tokenizer(
-            body,
+            [text],
             return_tensors="pt",
             truncation=True,
             max_length=self.tokenizer.model_max_length
@@ -632,12 +811,20 @@ class ShppoAgent(nn.Module):
             eos_token_id=self.tokenizer.eos_token_id,
             pad_token_id=self.tokenizer.eos_token_id,
         )
-        return self.tokenizer.decode(
+        decoded = self.tokenizer.decode(
             out[0][toks.input_ids.shape[-1]:],
             skip_special_tokens=True
         ).strip()
+        logging.info((
+            "============================================\n"
+            "Action template: %s\n"
+            "Generated action:\n%s\n"
+            "============================================"
+            % (action_template, decoded)
+        ))
         
-
+        return decoded
+        
 
 @dataclass
 class CFG:
@@ -667,8 +854,8 @@ class Buffer:
         self.logp= torch.zeros(T, n) # Log probabilities of chosen actions (T, N_AGENTS)
         self.rew = torch.zeros(T, n) # Rewards (T, N_AGENTS)
         self.val = torch.zeros(T, n) # Value predictions (T, N_AGENTS)
-        self.glob= torch.zeros(T, gd) # Global states (T, GLOB_DIM) - stored once per timestep
-        self.done= torch.zeros(T, dtype=torch.bool) # Done flags (T,) - stored once per timestep
+        self.glob = torch.zeros(T, n, gd)  # Global states per stream (T, n, GLOB_DIM)
+        self.done = torch.zeros(T, n, dtype=torch.bool)  # Done flags per stream (T, n)
         self.ptr = 0 # Pointer to the current position in the buffer
 
     def add(self, o, m, z, mu, sig, a, lp, r, v, g, d):
@@ -695,7 +882,7 @@ class Trainer:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.rnn     = nn.GRU(OBS_DIM, RNN_HIDDEN_SIZE, batch_first=True).to(self.device) 
-        self.actor   = ShppoAgent().to(self.device) 
+        self.actor   = MarCog()
         self.lat_net = LatentNet(OBS_DIM, RNN_HIDDEN_SIZE).to(self.device) 
         self.crit = MultiHeadCritic(GLOB_DIM, env.n_agents).to(self.device) 
         self.inf     = InfNet().to(self.device) 
@@ -712,53 +899,84 @@ class Trainer:
         self.optC = torch.optim.Adam(self.crit.parameters(), lr=cfg.lr) 
         self.optI = torch.optim.Adam(self.inf.parameters(), lr=cfg.lr_inf) 
         self.optL = torch.optim.Adam(self.lat_net.parameters(), lr=cfg.lr)
-        self.buf = Buffer(self.env.max_steps, self.env.n_agents, OBS_DIM, GLOB_DIM, RNN_HIDDEN_SIZE) 
-        self.env.actor = self.actor 
+        self.env.actor = self.actor
+        # Create vectorized environments for faster data collection
+        self.vec_env = VecEnv([
+            lambda: CodeGenEnv(split=self.env.split, actor=self.actor, n_agents=self.env.n_agents)
+            for _ in range(4)
+        ])
+        self.num_streams = self.vec_env.num_envs * self.env.n_agents
+        self.buf = Buffer(self.env.max_steps, self.num_streams, OBS_DIM, GLOB_DIM, RNN_HIDDEN_SIZE)
+        # Log for generated actions
+        self.generated_logs: list[dict] = []
 
-    def collect(self) -> float:
+    def collect(self, ep_num: int) -> float:
         self.buf.clear()
-        obs, glob = self.env.reset()
-        current_mem_rnn = torch.zeros(1, self.env.n_agents, RNN_HIDDEN_SIZE, device=self.device)
-        self.actor.set_prompts([self.env.task["prompt"]] * self.env.n_agents)
+        obs_np, glob_np = self.vec_env.reset()  # obs_np: (E, N, od), glob_np: (E, gd)
+        E, N, od = obs_np.shape
+        gd = glob_np.shape[1]
+        S = self.num_streams  # should equal E * N
 
-        for t in range(self.env.max_steps):
-            o_t = torch.tensor(obs, device=self.device, dtype=torch.float32)
-            g_t = torch.tensor(glob, device=self.device, dtype=torch.float32)
-            g_t_expanded = g_t.unsqueeze(0).repeat(self.env.n_agents, 1)
+        # Initialize RNN hidden state for all streams
+        current_mem = torch.zeros(1, S, RNN_HIDDEN_SIZE, device=self.device)
 
-            rnn_out, next_mem_rnn = self.rnn(o_t.unsqueeze(1), current_mem_rnn)
-            mem_for_actor = rnn_out.squeeze(1)
+        for t in trange(self.env.max_steps, position=1):
+            # Convert numpy to tensors
+            obs = torch.tensor(obs_np, device=self.device, dtype=torch.float32)  # (E, N, od)
+            glob = torch.tensor(glob_np, device=self.device, dtype=torch.float32)  # (E, gd)
 
+            # Flatten across streams
+            obs_flat = obs.reshape(S, od)  # (S, od)
+            glob_exp = glob.unsqueeze(1).expand(-1, N, -1).reshape(S, gd)  # (S, gd)
+
+            # RNN step
+            rnn_out, next_mem = self.rnn(obs_flat.unsqueeze(1), current_mem)  # (S,1,hd), (1,S,hd)
+            mem_flat = rnn_out.squeeze(1)  # (S, hd)
+
+            # Actor & latent
             with torch.no_grad():
-                z, mu, sig = self.lat_net(o_t, mem_for_actor)
-                dist = self.actor(o_t, mem_for_actor, z)
-                a = dist.sample()
-                lp = dist.log_prob(a)
-                agent_ids = torch.arange(self.env.n_agents, device=self.device)
-                v = self.crit(g_t_expanded, agent_ids=agent_ids)  # shape: (N,)
+                z, mu, sig = self.lat_net(obs_flat, mem_flat)  # (S, z)
+                dist = self.actor(obs_flat, mem_flat, z)  # Categorical(S,)
+                act_flat = dist.sample()  # (S,)
+                logp_flat = dist.log_prob(act_flat)  # (S,)
+                agent_ids = torch.arange(S, device=self.device) % N
+                val_flat = self.crit(glob_exp, agent_ids=agent_ids)  # (S,)
 
-            obs_next, glob_next, rew, done, outputs = self.env.step(a.cpu().numpy())
+            # Step vectorized env
+            acts_np = act_flat.cpu().numpy().reshape(E, N)
+            obs_np, glob_np, rew_np, done_np, outputs = self.vec_env.step(acts_np)
+            # Record generated actions
+            for stream_idx, per_agent_outputs in enumerate(outputs):
+                for agent_idx, (action_template, generated_text) in enumerate(per_agent_outputs):
+                    self.generated_logs.append({
+                        "episode": ep_num,
+                        "step": t,
+                        "stream": stream_idx,
+                        "agent": agent_idx,
+                        "action": action_template,
+                        "generated_text": generated_text,
+                    })
 
-            print(f"Step {t+1}:")
-            for agent_id, (tmpl, out) in enumerate(outputs, start=1):
-                snippet = out.replace("\n", " ")
-                tqdm.write(f"  Agent{agent_id} [{tmpl}]: {snippet}...")
-            print()
+            # Flatten rewards and done
+            rew_flat = torch.tensor(rew_np, dtype=torch.float32).reshape(S)
+            done_flat = torch.tensor(np.repeat(done_np, N), dtype=torch.bool)
 
+            # Store in buffer
             self.buf.add(
-                o_t.cpu(), mem_for_actor.cpu(), z.cpu(), mu.cpu(), sig.cpu(),
-                a.cpu(), lp.cpu(), torch.tensor(rew, dtype=torch.float32), v.cpu(),
-                g_t.cpu(), bool(done)
+                obs_flat.cpu(), mem_flat.cpu(), z.cpu(), mu.cpu(), sig.cpu(),
+                act_flat.cpu(), logp_flat.cpu(), rew_flat, val_flat.cpu(),
+                glob_exp.cpu(), done_flat
             )
 
-            obs, glob = obs_next, glob_next
-            current_mem_rnn = next_mem_rnn
-
-            if done:
+            current_mem = next_mem
+            if done_np.all():
                 break
 
-        final_glob_tensor = torch.tensor(glob, device=self.device, dtype=torch.float32).unsqueeze(0)
-        last_val = self.crit(final_glob_tensor).mean().item()
+        # Compute last value for advantage
+        obs = torch.tensor(obs_np, device=self.device, dtype=torch.float32)
+        glob = torch.tensor(glob_np, device=self.device, dtype=torch.float32)
+        glob_exp = glob.unsqueeze(1).expand(-1, N, -1).reshape(S, gd)
+        last_val = self.crit(glob_exp, agent_ids=torch.arange(S, device=self.device)).mean().item()
         return last_val
 
 
@@ -887,10 +1105,11 @@ class Trainer:
                 nn.utils.clip_grad_norm_(self.inf.parameters(), cfg.max_g)
                 self.optI.step()
 
+    
 
     def train(self, episodes: int):
-        for ep in trange(episodes, desc="Training Episodes"):
-            last_v = self.collect() 
+        for ep in trange(episodes, desc="Training Episodes", position=0):
+            last_v = self.collect(ep)
             data = self.buf.data()            
             if data['obs'].shape[0] == 0:
                 print(f"Episode {ep}: No data collected, skipping PPO update.")
@@ -904,6 +1123,10 @@ class Trainer:
             avg_pass_frac = self.env.pass_fraction 
 
             tqdm.write(f"Episode {ep}: Total Reward: {total_r_episode:.2f}, Final Pass Fraction: {avg_pass_frac:.2f}")
+        # Save generated actions log
+        df = pd.DataFrame(self.generated_logs)
+        df.to_csv("generated_actions.csv", index=False)
+        print(f"Saved {len(df)} generations to generated_actions.csv")
 
     def evaluate(self, test_agent_counts: List[int] = [3, 5, 7], num_eval_episodes: int = 10):
         """
@@ -969,16 +1192,38 @@ class Trainer:
 
 
 if __name__ == "__main__":
+    accelerator = Accelerator()
+    
     episodes = 100
     split    = "train"
     cfg      = CFG()
     env = CodeGenEnv(split=split, actor=None, n_agents=N_AGENTS)
     trainer  = Trainer(env, cfg)
-    
+    # Prepare models and optimizers for multi-GPU training
+    trainer.rnn, \
+    trainer.actor.model, trainer.actor.decoder, trainer.actor.head_mlp, \
+    trainer.lat_net, trainer.crit, trainer.inf, \
+    trainer.optA, trainer.optC, trainer.optI, trainer.optL = accelerator.prepare(
+        trainer.rnn,
+        trainer.actor.model, trainer.actor.decoder, trainer.actor.head_mlp,
+        trainer.lat_net,
+        trainer.crit,
+        trainer.inf,
+        trainer.optA,
+        trainer.optC,
+        trainer.optI,
+        trainer.optL,
+    )
+    # Ensure underlying HF model weights are materialized (not meta) before forward
+    trainer.actor.model = accelerator.unwrap_model(trainer.actor.model)
+    trainer.actor.model = trainer.actor.model.to(accelerator.device)
+    trainer.actor.decoder = trainer.actor.decoder.to(accelerator.device)
+    trainer.actor.head_mlp = trainer.actor.head_mlp.to(accelerator.device)
     print(f"Starting training for {episodes} episodes with {N_AGENTS} agents...")
 
     try:
         trainer.train(episodes)
+        
     except KeyboardInterrupt:
         print("\nTraining interrupted by user.")
     except Exception as e:

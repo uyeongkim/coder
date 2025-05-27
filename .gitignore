@@ -1,0 +1,5 @@
+shppo_emergent/
+supervised_model/
+*.txt
+*.log
+.vscode/
