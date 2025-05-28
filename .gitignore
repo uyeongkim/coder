@@ -3,3 +3,6 @@ supervised_model/
 *.txt
 *.log
 .vscode/
+*.pyc
+generated_samples/
+wandb/
