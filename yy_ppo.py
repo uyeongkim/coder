@@ -46,7 +46,7 @@ class TrainingConfig:
     MAX_TOKENS = 1024
     
     # Supervised Training
-    SUPERVISED_EPOCHS = 10
+    SUPERVISED_EPOCHS = 20
     SUPERVISED_LR = 5e-5
     
     # PPO Training
@@ -191,6 +191,9 @@ class SupervisedTrainer:
             ]
             
             for prompt_text in formats:
+                messages = [
+                    {"role": "system", "content": "You are an useful coding assistant."}
+                ]
                 tokens = self.tokenizer(
                     prompt_text, 
                     truncation=True, 
