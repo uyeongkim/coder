@@ -8,6 +8,7 @@ vectorized across multiple CodeTester instances.
 import os
 import math
 import torch
+from torch.distributions import Categorical
 import torch.nn as nn
 import torch.optim as optim
 from dataclasses import dataclass, field
@@ -37,10 +38,10 @@ class PPOConfig:
     rollout_length: int = 1      # single‐step episodes
     gamma: float = 0.99
     lam: float = 0.95
-    updates: int = 1000  # Number of PPO updates
+    updates: int = 10  # Number of PPO updates
 
     # PPO update
-    epochs: int = 1
+    epochs: int = 10
     clip_eps: float = 0.2
     vf_coef: float = 0.5
     ent_coef: float = 0.01
@@ -52,10 +53,11 @@ class PPOConfig:
 
     # Training
     max_problems_per_update: int = 10  # Number of problems to sample per update
+    sample_space: int = 4 # Action space size (number of test cases per problem)
     
     # Model Configuration
-    lora_r = 8
-    lora_alpha = 16
+    lora_r: int = 8
+    lora_alpha: int = 16
 
     def __post_init__(self):
         assert self.num_envs * self.rollout_length >= self.batch_size, \
@@ -118,6 +120,7 @@ def build_actor_and_critic(cfg: PPOConfig, device: torch.device) -> tuple:
         task_type="CAUSAL_LM",
     )
     actor = get_peft_model(actor_base, lora_cfg)
+    actor.train()
 
     # 4) Critic: uses same hidden size as Qwen
     hidden_dim = actor_base.config.hidden_size
@@ -210,77 +213,68 @@ class PPOTrainer:
         """Collect rollouts by sampling problems and generating solutions"""
         # Sample problems for this rollout
         problems = self.sample_problems(self.cfg.num_envs)
-        
+
         # Create a temporary dataset with the sampled problems
         temp_dataset = CodeContestDataset.__new__(CodeContestDataset)
         temp_dataset.tasks = problems
-        
+
         # Create a temporary CodeTester with the sampled problems
         temp_tester = CodeTester(
-            dataset=temp_dataset, 
-            batch_size=self.cfg.num_envs, 
+            dataset=temp_dataset,
+            batch_size=self.cfg.num_envs,
             max_workers=4
         )
-        
+
         # Generate solutions with hidden states and log probabilities
-        # The run method returns (avg_rate, hidden_states, generated_tokens, log_probs)
-        try:
-            result = temp_tester.run(
-                self.tokenizer,
-                self.actor,
-                return_hidden=True,
-                return_logprobs=True
-            )
-            
-            # Unpack the results
-            if isinstance(result, tuple) and len(result) == 4:
-                avg_rate, hidden_states, generated_tokens, log_probs = result
-            else:
-                raise ValueError(f"Expected 4 return values, got {len(result) if isinstance(result, tuple) else 1}")
-            
-            # Get the actual solutions from the responses
-            # We need to extract the solutions from the generated tokens
-            solutions = []
-            input_lengths = []
-            
-            # Decode the generated tokens to get solutions
-            for i in range(generated_tokens.shape[0]):
-                token_ids = generated_tokens[i]
-                # Remove padding tokens
-                non_pad_tokens = token_ids[token_ids != self.tokenizer.pad_token_id]
-                solution = self.tokenizer.decode(non_pad_tokens, skip_special_tokens=True)
-                solutions.append(solution)
-            
-        except Exception as e:
-            print(f"Error in temp_tester.run: {e}")
-            # Fallback: generate solutions without using the temporary tester
-            prompts = [problem['prompt'] for problem in problems]
-            
-            # Use the original tester's generation method
-            if hasattr(self.code_tester, 'ask_qwen_batch_optimized'):
-                result = self.code_tester.ask_qwen_batch_optimized(
-                    self.tokenizer, 
-                    self.actor, 
-                    prompts, 
-                    return_hidden=True, 
-                    return_logprobs=True
-                )
-                solutions, hidden_states, generated_tokens, log_probs = result
-            else:
-                raise Exception("Unable to generate solutions with hidden states and log probs")
-        
+        # Use ask_qwen_batch_optimized instead of run()
+        result = temp_tester.ask_qwen_batch_optimized(
+            tokenizer=self.tokenizer,
+            model=self.actor,
+            prompts=[problem['prompt'] for problem in problems],
+            return_hidden=True,
+            return_logprobs=True,
+            num_return_sequences=self.cfg.sample_space,
+        )
+        solutions, hidden_states, generated_tokens, log_probs = result
+
+        # Sample one candidate per prompt using the policy over candidates
+        batch_size = self.cfg.num_envs
+        num_return_sequences = self.cfg.sample_space  # must match call above
+        # Group generated solutions per prompt
+        grouped_solutions = [
+            solutions[i:i+num_return_sequences]
+            for i in range(0, len(solutions), num_return_sequences)
+        ]
+        # Reshape tokens and log_probs into [batch_size, num_return_sequences, ...]
+        tokens = generated_tokens.view(batch_size, num_return_sequences, -1)
+        probs = log_probs.view(batch_size, num_return_sequences)
+        # Build categorical distribution and sample
+        dist = Categorical(logits=probs)           # shape: [batch_size, num_return_sequences]
+        chosen_indices = dist.sample()              # shape: [batch_size]
+        # Select the sampled solutions and tokens
+        solutions = [
+            grouped_solutions[i][chosen_indices[i].item()]
+            for i in range(batch_size)
+        ]
+        generated_tokens = torch.stack([
+            tokens[i, chosen_indices[i]]
+            for i in range(batch_size)
+        ], dim=0)
+        # Use sampled log-prob for PPO update
+        log_probs = dist.log_prob(chosen_indices).to(self.device)  # shape: [batch_size]
+
         # Evaluate solutions to get rewards
-        rewards = self.evaluate_solutions_with_tester()
-        
+        rewards = self.code_tester.evaluate_solutions_with_tester()
+
         # Convert to tensors and move to device
         rewards_tensor = torch.tensor(rewards, dtype=torch.float32, device=self.device)
         hidden_states = hidden_states.to(self.device).float()
         log_probs = log_probs.to(self.device)
-        
+
         # Get value estimates from critic
         with torch.no_grad():
             values = self.critic(hidden_states)
-        
+
         return {
             "rewards": rewards_tensor,
             "values": values,
@@ -291,9 +285,13 @@ class PPOTrainer:
         }
 
     def compute_advantages(self, rewards: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
-        """Compute advantages using GAE"""
-        # For single-step episodes, advantage is simply reward - value
-        advantages = rewards - values
+        """Compute advantages using Generalized Advantage Estimation (GAE)"""
+        advantages = torch.zeros_like(rewards)
+        gae = 0.0
+        for t in reversed(range(len(rewards))):
+            delta = rewards[t] - values[t]
+            gae = delta + self.cfg.gamma * self.cfg.lam * gae
+            advantages[t] = gae
         return advantages
 
     def ppo_update(self, batch: Dict[str, torch.Tensor]):
@@ -325,18 +323,12 @@ class PPOTrainer:
             # Value loss
             value_loss = nn.MSELoss()(current_values, returns)
             
-            # For proper PPO, we need to compute current log probabilities
-            # This is a simplified version - in practice, you'd need to recompute
-            # the log probabilities by running the current policy on the same inputs
-            
-            # Simplified policy loss using advantage as proxy
-            # In a full implementation, you would:
-            # 1. Recompute log probabilities with current policy
-            # 2. Compute ratio = exp(new_log_probs - old_log_probs)
-            # 3. Apply PPO clipping to the ratio
-            
-            # For now, using advantage-weighted policy loss
-            policy_loss = -advantages.mean()
+            # PPO policy loss with clipping
+            # Placeholder for recomputing new log_probs
+            # (for now, assume we stored them in old_log_probs and don't change actor outputs)
+            ratios = torch.exp(old_log_probs - old_log_probs.detach())
+            clipped_ratios = torch.clamp(ratios, 1.0 - self.cfg.clip_eps, 1.0 + self.cfg.clip_eps)
+            policy_loss = -torch.min(ratios * advantages, clipped_ratios * advantages).mean()
             
             # Simple entropy bonus (using log_probs as proxy)
             entropy_loss = -old_log_probs.mean() * self.cfg.ent_coef

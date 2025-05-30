@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 import re
 from tqdm import tqdm, trange
+from multiprocessing import cpu_count
 from typing import Any, Dict, List, Tuple, Optional, Union
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers import BitsAndBytesConfig
@@ -40,7 +41,7 @@ def load_qwen_model(model_name: str = "Qwen/Qwen2.5-Coder-32B-Instruct"):
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,  # Reduce CPU memory usage
         trust_remote_code=True,
-        # attn_implementation="flash_attention_2"  # Use Flash Attention for speed
+        attn_implementation="flash_attention_2"  # Use Flash Attention for speed
     )
     
     # Optimize for inference
@@ -183,7 +184,10 @@ class CodeTester:
         """Extract solve function from model response - instance method"""
         return extract_solve_function(response, self.code_pattern)
     
-    def ask_qwen_batch_optimized(self, tokenizer, model, prompts: List[str], return_hidden: bool = False, return_logprobs: bool = False) -> Union[List[str], Tuple]:
+    def ask_qwen_batch_optimized(
+        self, tokenizer, model, prompts: List[str], 
+        return_hidden: bool = False, return_logprobs: bool = False, num_return_sequences: int = 1)\
+            -> Union[List[str], Tuple]:
         """Highly optimized batch generation with optional hidden state and log prob return"""
         responses = []
         all_hidden_states = []
@@ -222,38 +226,69 @@ class CodeTester:
             ).to(model.device)
             
             # Optimized generation parameters
-            with torch.no_grad():  # Disable gradient computation
-                # Get hidden states if requested
-                if return_hidden:
-                    # Forward pass to get hidden states
-                    forward_outputs = model(**inputs, output_hidden_states=True, return_dict=True)
-                    
-                    # Extract last hidden state of the last token for each sequence
-                    hidden_states = forward_outputs.hidden_states[-1]  # Last layer
-                    sequence_lengths = inputs.attention_mask.sum(dim=1) - 1  # Last non-pad token
-                    batch_hidden = hidden_states[torch.arange(hidden_states.size(0)), sequence_lengths, :]
-                    all_hidden_states.append(batch_hidden.cpu())
-                
-                # Generate responses with return_dict for accessing scores
+            if return_hidden:
                 outputs = model.generate(
                     **inputs,
                     max_new_tokens=512,  # Reduced from 1024 for speed
                     min_new_tokens=10,
-                    do_sample=False,  # Greedy decoding is faster than sampling
+                    do_sample=True,
+                    num_return_sequences=num_return_sequences,
                     pad_token_id=tokenizer.pad_token_id,
                     eos_token_id=tokenizer.eos_token_id,
                     use_cache=True,   # Enable KV caching
-                    num_beams=1,      # Greedy search
                     return_dict_in_generate=True,
                     output_scores=return_logprobs,  # Return scores for log prob computation
                 )
-                
                 generated_ids = outputs.sequences if hasattr(outputs, 'sequences') else outputs
+            else:    
+                with torch.no_grad():  # Disable gradient computation
+                    # Get hidden states if requested
+                    if return_hidden:
+                        # Forward pass to get hidden states
+                        forward_outputs = model(**inputs, output_hidden_states=True, return_dict=True)
+                        
+                        # Extract last hidden state of the last token for each sequence
+                        hidden_states = forward_outputs.hidden_states[-1]  # Last layer
+                        sequence_lengths = inputs.attention_mask.sum(dim=1) - 1  # Last non-pad token
+                        batch_hidden = hidden_states[torch.arange(hidden_states.size(0)), sequence_lengths, :]
+                        all_hidden_states.append(batch_hidden.cpu())
+                    
+                    # Generate responses with return_dict for accessing scores
+                    outputs = model.generate(
+                        **inputs,
+                        max_new_tokens=512,  # Reduced from 1024 for speed
+                        min_new_tokens=10,
+                        do_sample=True,
+                        num_return_sequences=num_return_sequences,
+                        pad_token_id=tokenizer.pad_token_id,
+                        eos_token_id=tokenizer.eos_token_id,
+                        use_cache=True,   # Enable KV caching
+                        return_dict_in_generate=True,
+                        output_scores=return_logprobs,  # Return scores for log prob computation
+                    )    
+                    generated_ids = outputs.sequences if hasattr(outputs, 'sequences') else outputs
             
             # Efficient decoding
             input_lengths = inputs.input_ids.shape[1]
             gen_ids = generated_ids[:, input_lengths:]  # More efficient slicing
-            decoded = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
+            decoded_all = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
+            grouped = [decoded_all[i:i+num_return_sequences] for i in range(0, len(decoded_all), num_return_sequences)]
+            logprog_gruops = [all_log_probs[i:i+num_return_sequences] for i in range(0, len(all_log_probs), num_return_sequences)] if return_logprobs else []
+            
+            decoded = []
+            selected_log_probs = []
+            for texts, probs in zip(grouped, logprog_gruops):
+                if len(texts) == 1:
+                    decoded.append(texts[0])
+                    if return_logprobs:
+                        selected_log_probs.append(probs[0])
+                else:
+                    best_idx = torch.argmax(torch.stack(probs)).item() if return_logprobs else 0
+                    decoded.append(texts[best_idx])
+                    selected_log_probs.append(probs[best_idx]) if return_logprobs else None
+                    
+            all_log_probs.extend(selected_log_probs)
+                
             responses.extend(decoded)
             
             # Store generated tokens and compute log probs if requested
@@ -424,11 +459,11 @@ def main():
     os.environ["TOKENIZERS_PARALLELISM"] = "false"  # Disable parallel tokenization to avoid issues
     # Enable optimizations
     torch.backends.cudnn.benchmark = True  # Optimize for consistent input sizes
-    torch.set_grad_enabled(False)  # Disable gradients globally for inference
+    torch.set_grad_enabled(False)  # Disable gradients globally for inference (baseline)
     
     dataset = CodeContestDataset(split="train")
     tokenizer, model = load_qwen_model(model_name="Qwen/Qwen2.5-Coder-32B-Instruct")
-    tester = CodeTester(dataset=dataset, batch_size=128, max_workers=8)
+    tester = CodeTester(dataset=dataset, batch_size=200, max_workers=cpu_count() // 2)
     
     avg_rate = tester.run(tokenizer, model)
     print(f"Final average pass rate: {avg_rate:.2f}%")
