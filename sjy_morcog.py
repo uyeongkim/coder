@@ -1,5 +1,11 @@
 # shppo_emergent.py
+
 from __future__ import annotations
+
+import os
+# Ensure Triton autotune cache directory exists to suppress warnings
+autotune_dir = os.path.expanduser("~/.triton/autotune")
+os.makedirs(autotune_dir, exist_ok=True)
 
 # ────────────────────────────────────── stdlib ─────────────────────────────────────
 import itertools
@@ -15,8 +21,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import math
 import textwrap
 
-# ─────────────────────────────────── third-party ───────────────────────────────────
 import numpy as np
+import pandas as pd
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -31,6 +38,45 @@ from transformers import (
 )
 from peft import get_peft_model, LoraConfig
 import re
+from accelerate import Accelerator
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    filename="morcog.log",
+    filemode="a",
+    format="%(asctime)s %(levelname)s: %(message)s"
+)
+# Suppress verbose Hugging Face and HTTP client logs
+logging.getLogger("transformers").setLevel(logging.WARNING)
+logging.getLogger("datasets").setLevel(logging.WARNING)
+logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("s3transfer").setLevel(logging.WARNING)
+class VecEnv:
+    """
+    Simple vectorized wrapper for CodeGenEnv to run multiple environments in parallel.
+    """
+    def __init__(self, env_fns: list[callable]):
+        self.envs = [fn() for fn in env_fns]
+        self.num_envs = len(self.envs)
+        self.n_agents = self.envs[0].n_agents
+
+    def reset(self):
+        # Returns obs: (num_envs, n_agents, obs_dim), globs: (num_envs, glob_dim)
+        obs_list, glob_list = zip(*(env.reset() for env in self.envs))
+        return np.stack(obs_list), np.stack(glob_list)
+
+    def step(self, actions: np.ndarray):
+        # actions: array of shape (num_envs, n_agents)
+        results = [env.step(a) for env, a in zip(self.envs, actions)]
+        obs_list, glob_list, rew_list, done_list, out_list = zip(*results)
+        return (
+            np.stack(obs_list),
+            np.stack(glob_list),
+            np.stack(rew_list),
+            np.stack(done_list),
+            list(out_list),
+        )
 
 warnings.filterwarnings("ignore", category=UserWarning, module="bitsandbytes")
 
@@ -93,17 +139,25 @@ def cosine_dist(x: torch.Tensor) -> torch.Tensor:
 # 1. Dataset loader ------------------------------------------------------------
 # ==============================================================================
 class CodeContestDataset:
+    _cache: Dict[str, List[Dict[str, Any]]] = {}
+
     def __init__(self, split: str = "train") -> None:
+        if split in CodeContestDataset._cache:
+            self.tasks = CodeContestDataset._cache[split]
+            return
         ds = load_dataset("deepmind/code_contests", split=split, trust_remote_code=True)
-        self.tasks: List[Dict[str, Any]] = []
+        tasks: List[Dict[str, Any]] = []
         for row in ds:
             ins, outs = row["public_tests"]["input"], row["public_tests"]["output"]
-            self.tasks.append({
-                "name": row["name"], 
-                "prompt": row["description"], 
-                "tests_public": list(zip(ins, outs)), 
-                "observation_features": self._embed(row["description"]), 
+            
+            tasks.append({
+                "name": row["name"],
+                "prompt": row["description"],
+                "tests_public": list(zip(ins, outs)),
+                "observation_features": self._embed(row["description"]),
             })
+        self.tasks = tasks
+        CodeContestDataset._cache[split] = tasks
 
     @staticmethod
     def _embed(text: str, dim: int = OBS_DIM) -> np.ndarray:
@@ -149,6 +203,15 @@ def exec_solution(src: str, stdin: Any, timeout: float = 2.0) -> Tuple[str, str]
     fn_name = find_function_name(impl_block)
     if not fn_name:
         return "", "No valid function found"
+    
+    logging.info((
+        "&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&\n"
+        f"\nExecuting function: {fn_name}\n"
+        "Block Start"
+        f"\n{impl_block}\n"
+        "Block End\n"
+    ))
+    
     wrapped = build_py_wrap(impl_block, fn_name)
 
     if isinstance(stdin, (bytes, bytearray)):
@@ -217,6 +280,7 @@ class CodeGenEnv:
         actor: MarCog | None = None,
         n_agents: int = N_AGENTS
     ) -> None:
+        self.split = split
         self.ds       = CodeContestDataset(split)
         self.n_agents = n_agents
         self.obs_dim, self.glob_dim = OBS_DIM, GLOB_DIM
@@ -230,7 +294,6 @@ class CodeGenEnv:
         self.last_error     = ""
         self.step_i         = 0
 
-        self.reset()
 
     @staticmethod
     def _embed(text: str, dim: int) -> np.ndarray:
@@ -245,18 +308,22 @@ class CodeGenEnv:
         self.last_error    = ""
         self.current_prompt = self.task["prompt"]
 
+        if self.actor:
+            self.actor.set_prompts([self.current_prompt] * self.n_agents)
+
         o0   = self._make_obs()
         obs  = np.stack([o0] * self.n_agents)
         glob = self._embed(self.task["name"], self.glob_dim)
-
-        if self.actor:
-            self.actor.set_prompts([self.current_prompt] * self.n_agents)
 
         return obs, glob
 
     def _make_obs(self) -> np.ndarray:
         q = self.obs_dim // 3
-        p = self._embed(self.current_prompt, q)
+        if self.actor and self.actor._pooled_features is not None:
+            # use base-model’s pooled prompt embedding, truncated to q
+            p = self.actor._pooled_features[0, :q].cpu().numpy()
+        else:
+            p = self._embed(self.current_prompt, q)
         c = self._embed(self.code, q)
         e = self._embed(self.last_error, self.obs_dim - 2*q)
         e[0] = self.pass_fraction
@@ -380,8 +447,6 @@ class CodeGenEnv:
             elif int(idx) in DEBUG_ACTIONS:
                 reward_scalar += 0.015
         
-
-        
         done  = (pf == 1.0) or (self.step_i >= self.max_steps)
         obs   = np.stack([self._make_obs()] * self.n_agents)
         glob  = self._embed(self.task["name"], self.glob_dim)
@@ -473,7 +538,8 @@ class MultiHeadCritic(nn.Module):
                     out = self.heads[i](h[mask]).squeeze(-1)  # (M,)
                     outputs.append((mask, out))
 
-            values = torch.zeros(B, device=glob.device)
+            # Initialize with same dtype as head outputs (e.g., bfloat16 under autocast)
+            values = torch.zeros(B, device=glob.device, dtype=h.dtype)
             for mask, out in outputs:
                 values[mask] = out
             return values  # shape: (B,)
@@ -485,8 +551,16 @@ class MarCog(nn.Module):
     def __init__(self, repo: str = "Qwen/Qwen2.5-Coder-32B-Instruct", n_agents: int = N_AGENTS):
         super().__init__()
         bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16)
-        base = AutoModelForCausalLM.from_pretrained(repo, device_map="auto" if torch.cuda.is_available() else None,
-                                                    quantization_config=bnb, trust_remote_code=True)
+        # Map this process to a single GPU so PEFT works on each rank
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        device_map = {"": local_rank} if torch.cuda.is_available() else None
+        base = AutoModelForCausalLM.from_pretrained(
+            repo,
+            device_map=device_map,
+            quantization_config=bnb,
+            trust_remote_code=True,
+            low_cpu_mem_usage=False
+        )
         self.tokenizer = AutoTokenizer.from_pretrained(repo, trust_remote_code=True)
         self.tokenizer.pad_token = self.tokenizer.eos_token
         peft_cfg = LoraConfig(task_type="CAUSAL_LM", inference_mode=False, r=8, lora_alpha=16, lora_dropout=0.05)
@@ -506,12 +580,24 @@ class MarCog(nn.Module):
         return next(self.model.parameters()).device
 
     def set_prompts(self, prompts: List[str]):
-        prompts = prompts[: self.n_agents]
         if prompts == self._last_prompts:
             return
         self._last_prompts = prompts
+        
+        messages = []
+        for i, prompt in enumerate(prompts):
+            messages.append([
+                {"role": "system", "content": "You are a helpful code generation assistant."},
+                {"role": "user", "content": prompt}
+            ])
+        texts = self.tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+        
         toks = self.tokenizer(
-            prompts,
+            texts,
             return_tensors="pt",
             padding=True,
             truncation=True,
@@ -533,7 +619,9 @@ class MarCog(nn.Module):
 
         pooled = self._pooled_features[agent_ids] 
         feat = torch.cat([pooled, obs, mem], dim=-1)
-        assert feat.shape[1] == self.decoder.hdim, f"Expected feat_dim={self.decoder.hdim}, got {feat.shape[1]}"
+        # Support DDP-wrapped decoder
+        dec = self.decoder.module if hasattr(self.decoder, "module") else self.decoder
+        assert feat.shape[1] == dec.hdim, f"Expected feat_dim={dec.hdim}, got {feat.shape[1]}"
 
         W, b = self.decoder(z)  
         logits = torch.bmm(W, feat.unsqueeze(-1)).squeeze(-1) + b
@@ -654,8 +742,58 @@ class MarCog(nn.Module):
 
         else:
             raise ValueError(f"Unknown action_template: {action_template}")
+        
+        # Few-shot examples per action_template
+        examples_dict = {
+            "plan-subgoal": [
+                {"role": "user", "content": "Task:\nCompute factorial of a number\nAction: plan-subgoal\nOutline the steps in bullet points."},
+                {"role": "assistant", "content": "- Parse input integer\n- Initialize result to 1\n- Loop from 1 to N, multiply result\n- Return result as string"}
+            ],
+            "rephrase-prompt": [
+                {"role": "user", "content": "Original Prompt:\nAdd two numbers and print the sum.\nAction: rephrase-prompt\nRewrite it more clearly and formally."},
+                {"role": "assistant", "content": "Write a program that reads two integers from input and outputs their sum."}
+            ],
+            "assess-subgoals": [
+                {"role": "user", "content": "Task:\nCompute GCD of two numbers\nSubgoal plan:\n- Parse input\n- Apply Euclidean algorithm\nAction: assess-subgoals\nEvaluate the plan."},
+                {"role": "assistant", "content": "The plan is valid but missing a check for zero input as a base case. Consider adding that step."}
+            ],
+            "generate-code": [
+                {"role": "user", "content": "Task:\nReverse the input string\nAction: generate-code\nImplement solve function."},
+                {"role": "assistant", "content": "def solve(input_data: str) -> str:\n    return input_data[::-1]"}
+            ],
+            "optimize-code": [
+                {"role": "user", "content": "Task:\nSort a list of integers\nAction: optimize-code\nExisting solution uses bubble sort."},
+                {"role": "assistant", "content": "def solve(input_data: str) -> str:\n    nums = list(map(int, input_data.split()))\n    nums.sort()\n    return ' '.join(map(str, nums))"}
+            ],
+            "self-review": [
+                {"role": "user", "content": "Task:\nCompute factorial\nCode for review:\ndef solve(input_data: str) -> str:\n    n = int(input_data)\n    res = 1\n    for i in range(n):\n        res *= i\n    return str(res)\nAction: self-review\nIdentify issues."},
+                {"role": "assistant", "content": "The loop starts from 0, which will zero out the result. You should loop from 1 to n inclusive instead."}
+            ],
+            "patch-bug": [
+                {"role": "user", "content": "Task:\nAdd two numbers\nCode needing fix:\ndef solve(input_data: str) -> str:\n    a, b = input_data.split()\n    return str(int(a) - int(b))\nAction: patch-bug\nFix the subtraction error."},
+                {"role": "assistant", "content": "def solve(input_data: str) -> str:\n    a, b = input_data.split()\n    return str(int(a) + int(b))"}
+            ],
+            "unit-fix": [
+                {"role": "user", "content": "Task:\nMultiply two numbers\nFailing Code:\ndef solve(input_data: str) -> str:\n    a, b = map(int, input_data.split())\n    return str(a * b)\nTests:\nInput: '2 3', Expected: '6'\nAction: unit-fix\nFix if needed."},
+                {"role": "assistant", "content": "The code passes the test as is, no changes needed."}
+            ],
+            "noop": [
+                {"role": "user", "content": "Task:\nNo changes required\nAction: noop\nDo nothing."},
+                {"role": "assistant", "content": "# No operation selected. Skipping step."}
+            ]
+        }
+        few_shot_examples = examples_dict.get(action_template, [])
+        messages = few_shot_examples + [
+            {"role": "system", "content": "You are a helpful code generation assistant."},
+            {"role": "user", "content": body},
+        ]
+        text = self.tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=False,
+        )
         toks = self.tokenizer(
-            body,
+            [text],
             return_tensors="pt",
             truncation=True,
             max_length=self.tokenizer.model_max_length
@@ -673,12 +811,20 @@ class MarCog(nn.Module):
             eos_token_id=self.tokenizer.eos_token_id,
             pad_token_id=self.tokenizer.eos_token_id,
         )
-        return self.tokenizer.decode(
+        decoded = self.tokenizer.decode(
             out[0][toks.input_ids.shape[-1]:],
             skip_special_tokens=True
         ).strip()
+        logging.info((
+            "============================================\n"
+            "Action template: %s\n"
+            "Generated action:\n%s\n"
+            "============================================"
+            % (action_template, decoded)
+        ))
         
-
+        return decoded
+        
 
 @dataclass
 class CFG:
@@ -708,8 +854,8 @@ class Buffer:
         self.logp= torch.zeros(T, n) # Log probabilities of chosen actions (T, N_AGENTS)
         self.rew = torch.zeros(T, n) # Rewards (T, N_AGENTS)
         self.val = torch.zeros(T, n) # Value predictions (T, N_AGENTS)
-        self.glob= torch.zeros(T, gd) # Global states (T, GLOB_DIM) - stored once per timestep
-        self.done= torch.zeros(T, dtype=torch.bool) # Done flags (T,) - stored once per timestep
+        self.glob = torch.zeros(T, n, gd)  # Global states per stream (T, n, GLOB_DIM)
+        self.done = torch.zeros(T, n, dtype=torch.bool)  # Done flags per stream (T, n)
         self.ptr = 0 # Pointer to the current position in the buffer
 
     def add(self, o, m, z, mu, sig, a, lp, r, v, g, d):
@@ -736,7 +882,7 @@ class Trainer:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.rnn     = nn.GRU(OBS_DIM, RNN_HIDDEN_SIZE, batch_first=True).to(self.device) 
-        self.actor   = MarCog().to(self.device) 
+        self.actor   = MarCog()
         self.lat_net = LatentNet(OBS_DIM, RNN_HIDDEN_SIZE).to(self.device) 
         self.crit = MultiHeadCritic(GLOB_DIM, env.n_agents).to(self.device) 
         self.inf     = InfNet().to(self.device) 
@@ -753,53 +899,84 @@ class Trainer:
         self.optC = torch.optim.Adam(self.crit.parameters(), lr=cfg.lr) 
         self.optI = torch.optim.Adam(self.inf.parameters(), lr=cfg.lr_inf) 
         self.optL = torch.optim.Adam(self.lat_net.parameters(), lr=cfg.lr)
-        self.buf = Buffer(self.env.max_steps, self.env.n_agents, OBS_DIM, GLOB_DIM, RNN_HIDDEN_SIZE) 
-        self.env.actor = self.actor 
+        self.env.actor = self.actor
+        # Create vectorized environments for faster data collection
+        self.vec_env = VecEnv([
+            lambda: CodeGenEnv(split=self.env.split, actor=self.actor, n_agents=self.env.n_agents)
+            for _ in range(4)
+        ])
+        self.num_streams = self.vec_env.num_envs * self.env.n_agents
+        self.buf = Buffer(self.env.max_steps, self.num_streams, OBS_DIM, GLOB_DIM, RNN_HIDDEN_SIZE)
+        # Log for generated actions
+        self.generated_logs: list[dict] = []
 
-    def collect(self) -> float:
+    def collect(self, ep_num: int) -> float:
         self.buf.clear()
-        obs, glob = self.env.reset()
-        current_mem_rnn = torch.zeros(1, self.env.n_agents, RNN_HIDDEN_SIZE, device=self.device)
-        self.actor.set_prompts([self.env.task["prompt"]] * self.env.n_agents)
+        obs_np, glob_np = self.vec_env.reset()  # obs_np: (E, N, od), glob_np: (E, gd)
+        E, N, od = obs_np.shape
+        gd = glob_np.shape[1]
+        S = self.num_streams  # should equal E * N
 
-        for t in range(self.env.max_steps):
-            o_t = torch.tensor(obs, device=self.device, dtype=torch.float32)
-            g_t = torch.tensor(glob, device=self.device, dtype=torch.float32)
-            g_t_expanded = g_t.unsqueeze(0).repeat(self.env.n_agents, 1)
+        # Initialize RNN hidden state for all streams
+        current_mem = torch.zeros(1, S, RNN_HIDDEN_SIZE, device=self.device)
 
-            rnn_out, next_mem_rnn = self.rnn(o_t.unsqueeze(1), current_mem_rnn)
-            mem_for_actor = rnn_out.squeeze(1)
+        for t in trange(self.env.max_steps, position=1):
+            # Convert numpy to tensors
+            obs = torch.tensor(obs_np, device=self.device, dtype=torch.float32)  # (E, N, od)
+            glob = torch.tensor(glob_np, device=self.device, dtype=torch.float32)  # (E, gd)
 
+            # Flatten across streams
+            obs_flat = obs.reshape(S, od)  # (S, od)
+            glob_exp = glob.unsqueeze(1).expand(-1, N, -1).reshape(S, gd)  # (S, gd)
+
+            # RNN step
+            rnn_out, next_mem = self.rnn(obs_flat.unsqueeze(1), current_mem)  # (S,1,hd), (1,S,hd)
+            mem_flat = rnn_out.squeeze(1)  # (S, hd)
+
+            # Actor & latent
             with torch.no_grad():
-                z, mu, sig = self.lat_net(o_t, mem_for_actor)
-                dist = self.actor(o_t, mem_for_actor, z)
-                a = dist.sample()
-                lp = dist.log_prob(a)
-                agent_ids = torch.arange(self.env.n_agents, device=self.device)
-                v = self.crit(g_t_expanded, agent_ids=agent_ids)  # shape: (N,)
+                z, mu, sig = self.lat_net(obs_flat, mem_flat)  # (S, z)
+                dist = self.actor(obs_flat, mem_flat, z)  # Categorical(S,)
+                act_flat = dist.sample()  # (S,)
+                logp_flat = dist.log_prob(act_flat)  # (S,)
+                agent_ids = torch.arange(S, device=self.device) % N
+                val_flat = self.crit(glob_exp, agent_ids=agent_ids)  # (S,)
 
-            obs_next, glob_next, rew, done, outputs = self.env.step(a.cpu().numpy())
+            # Step vectorized env
+            acts_np = act_flat.cpu().numpy().reshape(E, N)
+            obs_np, glob_np, rew_np, done_np, outputs = self.vec_env.step(acts_np)
+            # Record generated actions
+            for stream_idx, per_agent_outputs in enumerate(outputs):
+                for agent_idx, (action_template, generated_text) in enumerate(per_agent_outputs):
+                    self.generated_logs.append({
+                        "episode": ep_num,
+                        "step": t,
+                        "stream": stream_idx,
+                        "agent": agent_idx,
+                        "action": action_template,
+                        "generated_text": generated_text,
+                    })
 
-            print(f"Step {t+1}:")
-            for agent_id, (tmpl, out) in enumerate(outputs, start=1):
-                snippet = out.replace("\n", " ")[:100]
-                tqdm.write(f"  Agent{agent_id} [{tmpl}]: {snippet}...")
-            print()
+            # Flatten rewards and done
+            rew_flat = torch.tensor(rew_np, dtype=torch.float32).reshape(S)
+            done_flat = torch.tensor(np.repeat(done_np, N), dtype=torch.bool)
 
+            # Store in buffer
             self.buf.add(
-                o_t.cpu(), mem_for_actor.cpu(), z.cpu(), mu.cpu(), sig.cpu(),
-                a.cpu(), lp.cpu(), torch.tensor(rew, dtype=torch.float32), v.cpu(),
-                g_t.cpu(), bool(done)
+                obs_flat.cpu(), mem_flat.cpu(), z.cpu(), mu.cpu(), sig.cpu(),
+                act_flat.cpu(), logp_flat.cpu(), rew_flat, val_flat.cpu(),
+                glob_exp.cpu(), done_flat
             )
 
-            obs, glob = obs_next, glob_next
-            current_mem_rnn = next_mem_rnn
-
-            if done:
+            current_mem = next_mem
+            if done_np.all():
                 break
 
-        final_glob_tensor = torch.tensor(glob, device=self.device, dtype=torch.float32).unsqueeze(0)
-        last_val = self.crit(final_glob_tensor).mean().item()
+        # Compute last value for advantage
+        obs = torch.tensor(obs_np, device=self.device, dtype=torch.float32)
+        glob = torch.tensor(glob_np, device=self.device, dtype=torch.float32)
+        glob_exp = glob.unsqueeze(1).expand(-1, N, -1).reshape(S, gd)
+        last_val = self.crit(glob_exp, agent_ids=torch.arange(S, device=self.device)).mean().item()
         return last_val
 
 
@@ -931,8 +1108,8 @@ class Trainer:
     
 
     def train(self, episodes: int):
-        for ep in trange(episodes, desc="Training Episodes"):
-            last_v = self.collect() 
+        for ep in trange(episodes, desc="Training Episodes", position=0):
+            last_v = self.collect(ep)
             data = self.buf.data()            
             if data['obs'].shape[0] == 0:
                 print(f"Episode {ep}: No data collected, skipping PPO update.")
@@ -946,6 +1123,10 @@ class Trainer:
             avg_pass_frac = self.env.pass_fraction 
 
             tqdm.write(f"Episode {ep}: Total Reward: {total_r_episode:.2f}, Final Pass Fraction: {avg_pass_frac:.2f}")
+        # Save generated actions log
+        df = pd.DataFrame(self.generated_logs)
+        df.to_csv("generated_actions.csv", index=False)
+        print(f"Saved {len(df)} generations to generated_actions.csv")
 
     def evaluate(self, test_agent_counts: List[int] = [3, 5, 7], num_eval_episodes: int = 10):
         """
@@ -1011,16 +1192,38 @@ class Trainer:
 
 
 if __name__ == "__main__":
+    accelerator = Accelerator()
+    
     episodes = 100
     split    = "train"
     cfg      = CFG()
     env = CodeGenEnv(split=split, actor=None, n_agents=N_AGENTS)
     trainer  = Trainer(env, cfg)
-    
+    # Prepare models and optimizers for multi-GPU training
+    trainer.rnn, \
+    trainer.actor.model, trainer.actor.decoder, trainer.actor.head_mlp, \
+    trainer.lat_net, trainer.crit, trainer.inf, \
+    trainer.optA, trainer.optC, trainer.optI, trainer.optL = accelerator.prepare(
+        trainer.rnn,
+        trainer.actor.model, trainer.actor.decoder, trainer.actor.head_mlp,
+        trainer.lat_net,
+        trainer.crit,
+        trainer.inf,
+        trainer.optA,
+        trainer.optC,
+        trainer.optI,
+        trainer.optL,
+    )
+    # Ensure underlying HF model weights are materialized (not meta) before forward
+    trainer.actor.model = accelerator.unwrap_model(trainer.actor.model)
+    trainer.actor.model = trainer.actor.model.to(accelerator.device)
+    trainer.actor.decoder = trainer.actor.decoder.to(accelerator.device)
+    trainer.actor.head_mlp = trainer.actor.head_mlp.to(accelerator.device)
     print(f"Starting training for {episodes} episodes with {N_AGENTS} agents...")
 
     try:
         trainer.train(episodes)
+        
     except KeyboardInterrupt:
         print("\nTraining interrupted by user.")
     except Exception as e:
