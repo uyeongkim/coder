@@ -56,7 +56,7 @@ class SHPPOConfig:
     optimizer_type: str = "Adam"
 
     # LLM and LoRA Configuration
-    llm_model_name: str = "Qwen/Qwen1.5-7B-Chat-GPTQ-Int4"
+    llm_model_name: str = "Qwen/Qwen2.5-Coder-32B-Instruct"
     lora_r: int = 8
     lora_alpha: int = 16
     lora_dropout: float = 0.05

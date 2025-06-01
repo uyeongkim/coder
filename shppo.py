@@ -26,8 +26,10 @@ logger = logging.getLogger(__name__)
 
 def ortho_init(m: nn.Module, gain: float = 1.0):
     """Orthogonal initialization for linear layers."""
-    if isinstance(m, nn.Linear): nn.init.orthogonal_(m.weight, gain=gain)
-    if m.bias is not None: nn.init.constant_(m.bias, 0)
+    if isinstance(m, nn.Linear): 
+        nn.init.orthogonal_(m.weight, gain=gain)
+        if m.bias is not None: 
+            nn.init.constant_(m.bias, 0)
 
 class MLPBlock(nn.Module):
     """A simple MLP block with configurable layers and ReLU activations."""
@@ -239,7 +241,8 @@ def build_networks(config: SHPPOConfig, device: torch.device) -> Dict[str, Any]:
     tokenizer.padding_side = "left"
     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
     
-    bnb_cfg = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True)
+    bnb_cfg = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.bfloat16,  bnb_4bit_use_double_quant=True,
+        llm_int8_enable_fp32_cpu_offload=True)
     try: 
         llm_base = AutoModelForCausalLM.from_pretrained(
             config.llm_model_name, 
@@ -1316,12 +1319,6 @@ if __name__ == "__main__":
     config.evaluate_interval = 5 # Evaluate more frequently for testing
     config.wandb_project_name = None # Disable WandB for local test runs unless specified
     
-    # Use a smaller, easily accessible model for testing if a large one isn't available or needed
-    # config.llm_model_name = "gpt2" 
-    # if config.llm_model_name == "gpt2":
-    #     config.lora_target_modules = ["c_attn"] # LoRA target for gpt2
-    # else: # Default for Qwen
-    #     config.lora_target_modules = ["q_proj", "v_proj", "k_proj", "o_proj"]
 
 
     try:
