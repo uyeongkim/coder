@@ -1,0 +1,1362 @@
+# shppo_trainer.py
+import os
+import sys
+import math
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from typing import List, Dict, Any, Tuple, Optional
+import torch.nn.functional as F
+import random
+import numpy as np
+import pandas as pd
+import logging
+import wandb
+
+from transformers import (
+    AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig,
+    GenerationConfig
+)
+from peft import get_peft_model, LoraConfig, PeftModel
+
+from shppo_config import SHPPOConfig
+from shppo_env import SHPPOCodeEnv, CodeContestDataset 
+
+logger = logging.getLogger(__name__)
+
+def ortho_init(m: nn.Module, gain: float = 1.0):
+    """Orthogonal initialization for linear layers."""
+    if isinstance(m, nn.Linear): nn.init.orthogonal_(m.weight, gain=gain)
+    if m.bias is not None: nn.init.constant_(m.bias, 0)
+
+class MLPBlock(nn.Module):
+    """A simple MLP block with configurable layers and ReLU activations."""
+    def __init__(self, input_dim: int, output_dim: int, hidden_dim: int, num_layers: int = 3): 
+        super().__init__()
+        layers_list = []
+        current_dim = input_dim
+        for _ in range(num_layers - 1):
+            layers_list.extend([nn.Linear(current_dim, hidden_dim), nn.ReLU()])
+            current_dim = hidden_dim
+        layers_list.append(nn.Linear(current_dim, output_dim))
+        self.net = nn.Sequential(*layers_list)
+        self.net.apply(lambda m: ortho_init(m, math.sqrt(2))) # Standard gain for ReLU
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+class Encoder(nn.Module):
+    """
+    Encoder module for the LatentNet.
+    Takes agent's local observation embedding and previous actor RNN hidden state
+    to produce parameters (mu, sigma_raw) for the latent distributions of roles.
+    Corresponds to the Encoder part of LatentNet in SHPPO paper (Fig. 2a [cite: 140]).
+    """
+    def __init__(self, config: SHPPOConfig): 
+        super().__init__()
+        input_dim = config.obs_embed_dim + config.actor_rnn_hidden_dim
+        self.encoder_mlp = MLPBlock(input_dim, config.mlp_hidden_dim, hidden_dim=config.mlp_hidden_dim, num_layers=3)
+        # Output flat tensor for mu and sigma, to be reshaped into (N_ACTION_TEMPLATES, latent_dim)
+        self.fc_mu = nn.Linear(config.mlp_hidden_dim, config.N_ACTION_TEMPLATES * config.latent_dim)
+        self.fc_sigma = nn.Linear(config.mlp_hidden_dim, config.N_ACTION_TEMPLATES * config.latent_dim)
+        self.fc_mu.apply(lambda m: ortho_init(m, 0.01)) # Small gain for initial mu
+        self.fc_sigma.apply(lambda m: ortho_init(m, 0.01)) # Small gain for initial sigma
+    
+    def forward(self, obs_emb: torch.Tensor, h_actor_prev: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        x = torch.cat([obs_emb, h_actor_prev], dim=-1)
+        x = self.encoder_mlp(x)
+        return self.fc_mu(x), self.fc_sigma(x) # Return flat mu_raw, sigma_raw
+
+class LatentNet(nn.Module):
+    """
+    Latent Network (LatentNet) as described in SHPPO paper (Fig. 2a [cite: 140]).
+    It uses an Encoder to process observations and memory, then outputs sampled latent variables (z)
+    along with the mean (mu) and standard deviation (sigma) of the learned Gaussian distributions for each role.
+    These latents represent strategy patterns for agents. [cite: 5]
+    """
+    def __init__(self, encoder: Encoder, config: SHPPOConfig): 
+        super().__init__()
+        self.encoder = encoder
+        self.N_ACTION_TEMPLATES = config.N_ACTION_TEMPLATES
+        self.latent_dim = config.latent_dim
+    
+    def forward(self, obs_emb: torch.Tensor, h_actor_prev: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        mu_flat, sigma_raw_flat = self.encoder(obs_emb, h_actor_prev)
+        
+        # Reshape to (Batch_size, N_ACTION_TEMPLATES, latent_dim)
+        mu = mu_flat.view(-1, self.N_ACTION_TEMPLATES, self.latent_dim)
+        sigma_raw = sigma_raw_flat.view(-1, self.N_ACTION_TEMPLATES, self.latent_dim)
+        
+        # Apply softplus to ensure sigma is positive, add epsilon for numerical stability
+        sigma = F.softplus(sigma_raw) + 1e-5 
+        
+        # Reparameterization trick: z = mu + sigma * epsilon, where epsilon ~ N(0, I)
+        # This allows gradients to flow back through mu and sigma.
+        epsilon = torch.randn_like(sigma)
+        z = mu + sigma * epsilon # Sampled latent variable 'l_i' from paper [cite: 134]
+        return z, mu, sigma
+
+class InferenceNet(nn.Module):
+    """
+    Inference Network (InferenceNet) as described in SHPPO paper (Fig. 2b [cite: 140]).
+    It's a centralized network that takes global state embedding and the parameters (mu, sigma)
+    of latent distributions from all agents for all roles.
+    It predicts an intrinsic value V_I, used to guide the LatentNet learning. [cite: 50, 146]
+    Trained via supervised learning against actual returns (Eq. 11 [cite: 184]).
+    """
+    def __init__(self, config: SHPPOConfig): 
+        super().__init__()
+        # Input: global_state_emb + flattened_all_mu + flattened_all_sigma
+        input_dim = config.global_state_dim_for_inference + \
+                    (2 * config.num_marl_agents * config.N_ACTION_TEMPLATES * config.latent_dim)
+        self.v_head = MLPBlock(input_dim, 1, hidden_dim=config.mlp_hidden_dim, num_layers=3)
+    
+    def forward(self, glob_s_emb: torch.Tensor, all_mu_roles_all_agents: torch.Tensor, all_sig_roles_all_agents: torch.Tensor) -> torch.Tensor:
+        # all_mu_roles_all_agents shape: (Batch, Num_MARL_Agents, N_Action_Templates, Latent_Dim)
+        # glob_s_emb shape: (Batch, Global_State_Dim_Inference)
+        batch_size = glob_s_emb.shape[0]
+        
+        # Flatten mu and sigma tensors for concatenation
+        mu_flat = all_mu_roles_all_agents.reshape(batch_size, -1)
+        sig_flat = all_sig_roles_all_agents.reshape(batch_size, -1)
+        
+        x = torch.cat([glob_s_emb, mu_flat, sig_flat], dim=-1)
+        return self.v_head(x).squeeze(-1) # Return V_I
+
+class HeteLayerDecoder(nn.Module):
+    """
+    Decoder for the Heterogeneous Layer (HeteLayer) as in SHPPO paper (Fig. 2d [cite: 143]).
+    It takes a role-specific latent variable 'z_role' (l_i in paper) and decodes it into
+    the weights (W_i) and biases (b_i) for that role's HeteLayer instance in the ActorNet.
+    """
+    def __init__(self, latent_dim: int, hete_input_dim: int, hete_output_dim: int): 
+        super().__init__()
+        self.w_decoder = nn.Linear(latent_dim, hete_input_dim * hete_output_dim)
+        self.b_decoder = nn.Linear(latent_dim, hete_output_dim)
+        self.hete_input_dim = hete_input_dim
+        self.hete_output_dim = hete_output_dim
+        
+        # Initialize decoder weights with smaller scale as they generate other weights
+        self.w_decoder.apply(lambda m: ortho_init(m, math.sqrt(0.1))) 
+        self.b_decoder.apply(lambda m: ortho_init(m, math.sqrt(0.1)))
+    
+    def forward(self, z_role: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # z_role shape: (Batch_size * N_ACTION_TEMPLATES, latent_dim)
+        # Weights W need to be (Batch_size*N_ACTION_TEMPLATES, hete_output_dim, hete_input_dim) for bmm
+        weights = self.w_decoder(z_role).view(-1, self.hete_output_dim, self.hete_input_dim)
+        biases = self.b_decoder(z_role) # (Batch_size*N_ACTION_TEMPLATES, hete_output_dim)
+        return weights, biases
+
+class ActorNet(nn.Module):
+    """
+    Actor Network (ActorNet) for each agent, with a Heterogeneous Layer (HeteLayer)
+    as described in SHPPO paper (Fig. 2c [cite: 142]).
+    It processes local observation embeddings, uses an RNN for memory, and then
+    applies role-specific HeteLayers (parameters generated by HeteLayerDecoder from latents)
+    to produce action logits for role selection.
+    """
+    def __init__(self, config: SHPPOConfig): 
+        super().__init__()
+        self.config = config
+        self.obs_encoder = MLPBlock(config.obs_embed_dim, config.actor_rnn_hidden_dim, hidden_dim=config.mlp_hidden_dim)
+        self.rnn = nn.GRU(config.actor_rnn_hidden_dim, config.actor_rnn_hidden_dim, batch_first=True)
+        self.hete_layer_decoder = HeteLayerDecoder(config.latent_dim, config.hete_layer_input_dim, config.hete_layer_output_dim)
+        self.final_mlp = MLPBlock(config.hete_layer_output_dim, config.actor_final_mlp_output_dim, hidden_dim=config.mlp_hidden_dim)
+        self.policy_head = nn.Linear(config.actor_final_mlp_output_dim, 1) # Outputs a score for each role
+        self.policy_head.apply(lambda m: ortho_init(m, 0.01)) # Small gain for policy head
+
+    def forward(self, agent_obs_emb: torch.Tensor, agent_h_prev: torch.Tensor, z_all_roles_for_this_agent: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # agent_obs_emb: (Batch_agent, Obs_Embed_Dim)
+        # agent_h_prev: (Batch_agent, Actor_RNN_Hidden_Dim) - Note: GRU expects (1, Batch_agent, Hidden_Dim) for h_0
+        # z_all_roles_for_this_agent: (Batch_agent, N_ACTION_TEMPLATES, Latent_Dim)
+        
+        batch_agent_size = agent_obs_emb.size(0)
+        num_roles = self.config.N_ACTION_TEMPLATES
+
+        obs_features = self.obs_encoder(agent_obs_emb) # (Batch_agent, Actor_RNN_Hidden_Dim)
+        
+        # GRU expects input: (Batch, Seq, Feature) and h_0: (Num_Layers*Num_Directions, Batch, Hidden)
+        rnn_output, h_next_gru_unsq = self.rnn(obs_features.unsqueeze(1), agent_h_prev.unsqueeze(0))
+        actor_hidden_state = rnn_output.squeeze(1) # (Batch_agent, Actor_RNN_Hidden_Dim)
+        
+        # Prepare inputs for HeteLayer:
+        # Expand actor_hidden_state to match the number of roles
+        # (Batch_agent, Actor_RNN_Hidden_Dim) -> (Batch_agent, 1, Actor_RNN_Hidden_Dim)
+        #                                     -> (Batch_agent, N_Roles, Actor_RNN_Hidden_Dim)
+        #                                     -> (Batch_agent * N_Roles, Actor_RNN_Hidden_Dim)
+        actor_hidden_state_expanded = actor_hidden_state.unsqueeze(1).repeat(1, num_roles, 1)
+        actor_hidden_state_flat = actor_hidden_state_expanded.reshape(-1, self.rnn.hidden_size)
+        
+        # Flatten z_all_roles to (Batch_agent * N_Roles, Latent_Dim)
+        z_roles_flat = z_all_roles_for_this_agent.reshape(-1, self.config.latent_dim)
+        
+        # Generate HeteLayer parameters (weights W, biases b) for each role
+        W_roles, b_roles = self.hete_layer_decoder(z_roles_flat)
+        # W_roles: (Batch_agent*N_Roles, Hete_Out_Dim, Hete_In_Dim)
+        # b_roles: (Batch_agent*N_Roles, Hete_Out_Dim)
+        
+        # Apply HeteLayer: hete_features = W_roles @ actor_hidden_state_flat + b_roles
+        # actor_hidden_state_flat needs to be (Batch_agent*N_Roles, Hete_In_Dim, 1) for bmm
+        # Result hete_features: (Batch_agent*N_Roles, Hete_Out_Dim, 1) -> squeeze
+        hete_features = torch.bmm(W_roles, actor_hidden_state_flat.unsqueeze(-1)).squeeze(-1) + b_roles
+        # hete_features: (Batch_agent*N_Roles, Hete_Out_Dim)
+        
+        # Pass through final MLP and policy head
+        final_features = self.final_mlp(hete_features) # (Batch_agent*N_Roles, Actor_Final_MLP_Output_Dim)
+        role_scores_flat = self.policy_head(final_features) # (Batch_agent*N_Roles, 1)
+        
+        # Reshape role_scores to (Batch_agent, N_Roles) to represent logits for role selection
+        action_logits = role_scores_flat.view(batch_agent_size, num_roles)
+        action_probs = F.softmax(action_logits, dim=-1)
+        
+        return action_logits, h_next_gru_unsq.squeeze(0), action_probs # Squeeze h_next to match input shape
+
+class CriticNet(nn.Module):
+    """
+    Centralized Critic Network (CriticNet) as in SHPPO paper (Fig. 2b [cite: 140]).
+    It processes team global state embeddings using an RNN to estimate the team value V_C.
+    Used for advantage calculation in PPO.
+    """
+    def __init__(self, config: SHPPOConfig): 
+        super().__init__()
+        self.global_state_projector = MLPBlock(config.global_state_dim_for_critic, config.critic_rnn_hidden_dim, hidden_dim=config.mlp_hidden_dim, num_layers=2)
+        self.rnn = nn.GRU(config.critic_rnn_hidden_dim, config.critic_rnn_hidden_dim, batch_first=True)
+        self.value_head = MLPBlock(config.critic_rnn_hidden_dim, 1, hidden_dim=config.mlp_hidden_dim)
+        self.value_head.apply(lambda m: ortho_init(m, 1.0)) # Standard gain for value head
+    
+    def forward(self, glob_s_emb: torch.Tensor, h_crit_prev: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # glob_s_emb: (Batch_team, Global_State_Dim_Critic)
+        # h_crit_prev: (Batch_team, Critic_RNN_Hidden_Dim)
+        
+        projected_state = self.global_state_projector(glob_s_emb) # (Batch_team, Critic_RNN_Hidden_Dim)
+        rnn_output, h_crit_next_unsq = self.rnn(projected_state.unsqueeze(1), h_crit_prev.unsqueeze(0))
+        value_prediction = self.value_head(rnn_output.squeeze(1)).squeeze(-1) # (Batch_team)
+        return value_prediction, h_crit_next_unsq.squeeze(0) # Return V_C and next hidden state
+
+def build_networks(config: SHPPOConfig, device: torch.device) -> Dict[str, Any]:
+    """Builds and initializes all networks and the tokenizer."""
+    tokenizer = AutoTokenizer.from_pretrained(config.llm_model_name)
+    tokenizer.padding_side = "left"
+    if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
+    
+    bnb_cfg = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True)
+    try: 
+        llm_base = AutoModelForCausalLM.from_pretrained(
+            config.llm_model_name, 
+            quantization_config=bnb_cfg, 
+            device_map={"":device}, # Load model directly to the specified device
+            torch_dtype=torch.bfloat16, 
+            low_cpu_mem_usage=True, 
+            trust_remote_code=True
+        )
+    except Exception as e: 
+        logger.error(f"LLM base model loading failed: {e}. Check model name, network access, and CUDA setup if applicable."); raise
+        
+    lora_cfg = LoraConfig(
+        r=config.lora_r, 
+        lora_alpha=config.lora_alpha, 
+        target_modules=config.lora_target_modules, 
+        lora_dropout=config.lora_dropout, 
+        bias="none", 
+        task_type="CAUSAL_LM"
+    )
+    llm_peft_model = get_peft_model(llm_base, lora_cfg)
+    llm_trainable_params = [p for n,p in llm_peft_model.named_parameters() if "lora_" in n and p.requires_grad]
+    
+    if not llm_trainable_params: 
+        logger.warning("No LoRA trainable parameters found in LLM. LoRA might not be correctly configured or applied.")
+    else: 
+        logger.info(f"LLM LoRA applied to modules: {config.lora_target_modules}. Number of trainable LoRA params: {sum(p.numel() for p in llm_trainable_params)}")
+        
+    config.llm_actual_hidden_size = llm_base.config.hidden_size # type: ignore [attr-defined]
+    
+    encoder_module = Encoder(config).to(device)
+    latent_net_module = LatentNet(encoder_module, config).to(device)
+    actor_net_module = ActorNet(config).to(device)
+    critic_net_module = CriticNet(config).to(device)
+    inference_net_module = InferenceNet(config).to(device)
+    
+    params_dict = {
+        "llm_lora": llm_trainable_params, 
+        "actor_core": list(actor_net_module.parameters()), 
+        "critic": list(critic_net_module.parameters()), 
+        "latent": list(latent_net_module.parameters()), 
+        "inference": list(inference_net_module.parameters())
+    }
+    
+    return {
+        "llm_model": llm_peft_model, 
+        "tokenizer": tokenizer, 
+        "actor_net": actor_net_module, 
+        "critic_net": critic_net_module, 
+        "latent_net": latent_net_module, 
+        "inference_net": inference_net_module, 
+        "params": params_dict
+    }
+
+def cosine_diversity(z_roles_batch: torch.Tensor) -> torch.Tensor:
+    """
+    Calculates the cosine diversity among roles for a batch of agents.
+    z_roles_batch shape: (Batch_Size_Possibly_Combined * Num_Agents_if_Not_Flattened, Num_Roles, Latent_Dim)
+    This corresponds to L_d in SHPPO paper (Eq. 8 [cite: 179]). We want to maximize this term.
+    """
+    if z_roles_batch.size(1) <= 1: # Cannot compute diversity with 0 or 1 role
+        return torch.tensor(0.0, device=z_roles_batch.device)
+    
+    batch_diversities = []
+    for i in range(z_roles_batch.size(0)): # Iterate over each item in the batch (e.g., each agent)
+        z_item_roles = z_roles_batch[i] # (Num_Roles, Latent_Dim)
+        if z_item_roles.size(0) <= 1: # If this agent has 0 or 1 role defined (should not happen with N_ACTION_TEMPLATES > 1)
+            batch_diversities.append(torch.tensor(0.0, device=z_item_roles.device))
+            continue
+        
+        # Normalize latent vectors for cosine similarity calculation
+        z_normalized = F.normalize(z_item_roles, p=2, dim=-1) # (Num_Roles, Latent_Dim)
+        # Cosine similarity matrix: (Num_Roles, Num_Roles)
+        similarity_matrix = torch.matmul(z_normalized, z_normalized.transpose(-2, -1))
+        
+        # Use upper triangle (excluding diagonal) to get unique pair similarities
+        mask = torch.triu(torch.ones_like(similarity_matrix, dtype=torch.bool), diagonal=1)
+        
+        if mask.sum() > 0: # If there are pairs to compare
+            # Cosine distance = 1 - cosine similarity
+            distances = 1.0 - similarity_matrix[mask]
+            batch_diversities.append(distances.mean())
+        else: # No pairs (e.g., only one role)
+            batch_diversities.append(torch.tensor(0.0, device=z_item_roles.device))
+            
+    if not batch_diversities:
+        return torch.tensor(0.0, device=z_roles_batch.device)
+    return torch.stack(batch_diversities).mean() # Average diversity across the batch
+
+class SHPPOTrainer:
+    def __init__(self, cfg: SHPPOConfig, device: torch.device, env: SHPPOCodeEnv):
+        self.cfg = cfg
+        self.device = device
+        self.env = env
+        torch.manual_seed(cfg.seed); random.seed(cfg.seed); np.random.seed(cfg.seed)
+        
+        network_components = build_networks(cfg, device)
+        self.llm_model: PeftModel = network_components["llm_model"]
+        self.tokenizer = network_components["tokenizer"]
+        self.actor_net: ActorNet = network_components["actor_net"]
+        self.critic_net: CriticNet = network_components["critic_net"]
+        self.latent_net: LatentNet = network_components["latent_net"]
+        self.inference_net: InferenceNet = network_components["inference_net"]
+        
+        all_params = network_components["params"]
+        
+        # Calculate the expected input dimension to the state_projection_layer
+        # This combines LLM embedding, simple code/error embeddings, and one-hot last action
+        self.cfg.state_dim_before_projection = (
+            self.cfg.llm_actual_hidden_size + 
+            self.cfg.obs_simple_plan_embed_dim +
+            self.cfg.obs_simple_code_embed_dim + 
+            self.cfg.obs_simple_error_embed_dim + 
+            self.cfg.N_ACTION_TEMPLATES 
+        )
+        
+        if self.cfg.state_dim_before_projection != self.cfg.obs_embed_dim:
+            self.state_projection_layer: nn.Module = nn.Linear(
+                self.cfg.state_dim_before_projection, self.cfg.obs_embed_dim
+            ).to(self.device)
+            ortho_init(self.state_projection_layer, gain=math.sqrt(2))
+        else:
+            self.state_projection_layer = nn.Identity()
+            
+        actor_trainable_params = list(all_params["actor_core"])
+        if not isinstance(self.state_projection_layer, nn.Identity):
+            actor_trainable_params += list(self.state_projection_layer.parameters())
+        
+        self.opt_actor = getattr(optim, cfg.optimizer_type)(actor_trainable_params, lr=cfg.actor_learning_rate, eps=cfg.adam_eps, weight_decay=cfg.weight_decay)
+        self.opt_critic = getattr(optim, cfg.optimizer_type)(all_params["critic"], lr=cfg.critic_learning_rate, eps=cfg.adam_eps, weight_decay=cfg.weight_decay)
+        self.opt_latent = getattr(optim, cfg.optimizer_type)(all_params["latent"], lr=cfg.latent_learning_rate, eps=cfg.adam_eps, weight_decay=cfg.weight_decay)
+        self.opt_inference = getattr(optim, cfg.optimizer_type)(all_params["inference"], lr=cfg.inference_learning_rate, eps=cfg.adam_eps, weight_decay=cfg.weight_decay)
+        
+        if all_params["llm_lora"]:
+            self.opt_llm_lora = getattr(optim, cfg.optimizer_type)(all_params["llm_lora"], lr=cfg.llm_lora_learning_rate, eps=cfg.adam_eps, weight_decay=cfg.weight_decay)
+        else:
+            self.opt_llm_lora = None
+        
+        # Rollout buffer dimensions
+        S, B, Na, Nr, Dl = cfg.num_steps_per_env, cfg.num_envs, cfg.num_marl_agents, cfg.N_ACTION_TEMPLATES, cfg.latent_dim
+        Da_loc, Dglob_c, Dglob_i = cfg.obs_embed_dim, cfg.global_state_dim_for_critic, cfg.global_state_dim_for_inference
+        Drnn_a, Drnn_c = cfg.actor_rnn_hidden_dim, cfg.critic_rnn_hidden_dim
+        
+        self.rollout_buffer = {
+            "local_obs_embeddings": torch.zeros((S, B, Na, Da_loc), dtype=torch.float32, device=device), # For each agent
+            "global_state_embeddings_critic": torch.zeros((S, B, Dglob_c), dtype=torch.float32, device=device), # For team
+            "global_state_embeddings_inference": torch.zeros((S, B, Dglob_i), dtype=torch.float32, device=device), # For team
+            "actor_hidden_states": torch.zeros((S, B, Na, Drnn_a), dtype=torch.float32, device=device), # For each agent
+            "critic_hidden_states": torch.zeros((S, B, Drnn_c), dtype=torch.float32, device=device), # For team critic
+            "latents_z_all_roles": torch.zeros((S, B, Na, Nr, Dl), dtype=torch.float32, device=device), # For each agent, all roles
+            "latents_mu_all_roles": torch.zeros((S, B, Na, Nr, Dl), dtype=torch.float32, device=device),# For each agent, all roles
+            "latents_sigma_all_roles": torch.zeros((S, B, Na, Nr, Dl), dtype=torch.float32, device=device),# For each agent, all roles
+            "actions": torch.zeros((S, B, Na), dtype=torch.long, device=device), # Chosen role index for each agent
+            "log_probs": torch.zeros((S, B, Na), dtype=torch.float32, device=device), # Log prob of chosen role for each agent
+            "team_rewards": torch.zeros((S, B), dtype=torch.float32, device=device), # Team reward per team step
+            "team_values": torch.zeros((S, B), dtype=torch.float32, device=device),  # Team value from critic per team step
+            "team_dones": torch.zeros((S, B), dtype=torch.bool, device=device),    # Team done per team step
+        }
+        self.rollout_problem_llm_responses_for_csv: List[Tuple[Optional[Dict[str, Any]], str]] = [(None, "") for _ in range(cfg.num_envs)]
+        logger.info("SHPPOTrainer (MARL Sequential with step_agent_turn) initialized.")
+
+    def _simple_embed(self, text: str, dim: int) -> np.ndarray:
+        """A very basic text embedding method."""
+        vec=np.zeros(dim,dtype=np.float32)
+        if text and dim>0:
+            processed_text=text[:dim*4] # Limit text length to avoid excessive computation
+            for char_code in [ord(c) for c in processed_text if ord(c) < 256]: # Simple ASCII char processing
+                vec[char_code % dim] += 1
+            norm = np.linalg.norm(vec)
+            return vec / norm if norm > 1e-9 else vec
+        return vec
+
+    def _get_llm_embedding(self, text: str, max_length: int) -> torch.Tensor:
+        """Generates embedding for a given text using the configured LLM's input embeddings."""
+        if not text: return torch.zeros(self.cfg.llm_actual_hidden_size, device=self.device)
+        
+        inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=max_length, padding="max_length").to(self.device) # type: ignore [union-attr]
+        
+        with torch.no_grad():
+            # Access the base model's embedding layer correctly, works for PeftModel
+            base_model_for_embeddings = self.llm_model.get_input_embeddings() if hasattr(self.llm_model, "get_input_embeddings") else self.llm_model.base_model.model.get_input_embeddings()
+
+            embeddings = base_model_for_embeddings(inputs.input_ids) # (Batch=1, Seq_Len, Hidden_Size)
+            attention_mask = inputs.attention_mask.unsqueeze(-1).expand_as(embeddings).float() # (1, Seq_Len, Hidden_Size)
+            
+            sum_embeddings = torch.sum(embeddings * attention_mask, dim=1) # (1, Hidden_Size)
+            sum_mask = torch.clamp(attention_mask.sum(dim=1), min=1e-9) # (1, Hidden_Size) - sum over seq_len
+        
+        # Mean pooling of token embeddings
+        return (sum_embeddings / sum_mask.sum(dim=1, keepdim=True)).squeeze(0) # (Hidden_Size)
+
+    def get_agent_observation_embedding(self, agent_local_state_components: Dict[str, Any]) -> torch.Tensor:
+        prompt_text = agent_local_state_components.get("prompt", "")
+        team_code_text = agent_local_state_components.get("team_overall_code", "")
+        team_plan_text = agent_local_state_components.get("team_plan", "") 
+        team_pass_fraction_val = agent_local_state_components.get("team_pass_fraction", 0.0)
+        team_error_text = agent_local_state_components.get("team_errors_summary", "")
+        my_last_action_str = agent_local_state_components.get("my_last_action_str", self.cfg.ACTION_TEMPLATES[-1])
+        
+        prompt_emb = self._get_llm_embedding(prompt_text, self.cfg.max_prompt_length_for_embedding)
+        code_emb = torch.tensor(self._simple_embed(team_code_text, self.cfg.obs_simple_code_embed_dim), dtype=torch.float32, device=self.device)
+        plan_emb = torch.tensor(self._simple_embed(team_plan_text, self.cfg.obs_simple_plan_embed_dim), dtype=torch.float32, device=self.device) # <--- plan 임베딩 추가 (obs_simple_plan_embed_dim은 config에 새로 정의 필요)
+        
+        error_emb_np = np.zeros(self.cfg.obs_simple_error_embed_dim, dtype=np.float32)
+        if self.cfg.obs_simple_error_embed_dim > 0:
+            error_emb_np[0] = team_pass_fraction_val
+            error_text_dim = self.cfg.obs_simple_error_embed_dim - 1
+            if error_text_dim > 0:
+                error_emb_np[1:] = self._simple_embed(team_error_text, error_text_dim)
+        error_emb = torch.tensor(error_emb_np, dtype=torch.float32, device=self.device)
+        
+        last_action_idx = self.cfg.ACTION_TEMPLATES.index(my_last_action_str) if my_last_action_str in self.cfg.ACTION_TEMPLATES else self.cfg.N_ACTION_TEMPLATES - 1
+        last_action_one_hot = F.one_hot(torch.tensor(last_action_idx, device=self.device, dtype=torch.long), num_classes=self.cfg.N_ACTION_TEMPLATES).float()
+            
+        # Concatenate all feature embeddings
+        combined_features = torch.cat([prompt_emb,plan_emb, code_emb , error_emb, last_action_one_hot], dim=-1) # <--- plan_emb 추가
+        
+        # Project to the final observation embedding dimension
+        return self.state_projection_layer(combined_features)
+        
+    def get_team_global_state_embedding(self, team_global_state_components: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Constructs global state embeddings for Critic and Inference networks."""
+        pass_fraction = team_global_state_components.get("team_pass_fraction", 0.0)
+        episode_prog = team_global_state_components.get("episode_steps", 0)
+        
+        # Simple feature vector: [pass_fraction, normalized_episode_progress]
+        # Ensure max_team_episode_steps is not zero to avoid division by zero
+        normalized_eps = episode_prog / self.cfg.max_team_episode_steps if self.cfg.max_team_episode_steps > 0 else 0.0
+        feature_vector = torch.tensor([pass_fraction, normalized_eps], dtype=torch.float32, device=self.device)
+        
+        # Pad or truncate to fit critic's expected global state dimension
+        glob_s_critic = torch.zeros(self.cfg.global_state_dim_for_critic, device=self.device)
+        len_to_copy_critic = min(feature_vector.shape[0], self.cfg.global_state_dim_for_critic)
+        glob_s_critic[:len_to_copy_critic] = feature_vector[:len_to_copy_critic]
+        
+        # Pad or truncate to fit inference net's expected global state dimension
+        glob_s_inference = torch.zeros(self.cfg.global_state_dim_for_inference, device=self.device)
+        len_to_copy_inference = min(feature_vector.shape[0], self.cfg.global_state_dim_for_inference)
+        glob_s_inference[:len_to_copy_inference] = feature_vector[:len_to_copy_inference]
+        
+        return glob_s_critic, glob_s_inference
+
+    @torch.no_grad()
+    def generate_llm_response_for_action(
+        self,
+        agent_local_obs_components: Dict[str, Any],
+        action_template: str
+    ) -> str:
+        """Generates a detailed prompt based on the action template and agent's local observation, then calls the LLM."""
+        prompt_problem = agent_local_obs_components.get('prompt', "")
+        prev_code = agent_local_obs_components.get('team_overall_code', "")
+        prev_plan = agent_local_obs_components.get('team_plan', "")
+        errs = agent_local_obs_components.get('team_errors_summary', "")
+        pf = agent_local_obs_components.get('team_pass_fraction', 0.0)
+        marl_agent_idx = agent_local_obs_components.get('my_id', -1)
+
+        body = ""
+        if action_template == "plan-subgoal":
+            body = (
+                f"Task:\n{prompt_problem}\n\n"
+                f"Previous plan:\n{prev_plan}\n\n"
+                f"Current Pass fraction: {pf*100:.1f}%\n"
+                f"Observed Errors:\n{errs}\n\n"
+                f"Your Role (Agent {marl_agent_idx}): {action_template}\n"
+                f"Generate a concise, actionable, step-by-step plan (subgoals) to solve the task. Focus on the next few critical steps."
+            )
+        elif action_template == "rephrase-prompt":
+            body = (
+                f"Original Prompt:\n{prompt_problem}\n\n"
+                f"Your Role (Agent {marl_agent_idx}): {action_template}\n"
+                f"Rephrase the original prompt to be clearer, more specific, and highlight key constraints or objectives. This will help guide code generation."
+            )
+        elif action_template == "assess-subgoals":
+            if not prev_plan.strip(): return "# Skipped assess-subgoals: No current plan available."
+            body = (
+                f"Task:\n{prompt_problem}\n\n"
+                f"Current Plan (Subgoals) to Assess:\n{prev_plan}\n"
+                f"Current Pass fraction: {pf*100:.1f}%\n"
+                f"Observed Errors:\n{errs}\n\n"
+                f"Your Role (Agent {marl_agent_idx}): {action_template}\n"
+                f"Critically assess the provided plan. Is it logical? Does it cover all aspects of the task? Are the subgoals achievable and well-defined? Suggest specific improvements or point out flaws."
+            )
+        elif action_template == "generate-code":
+            body = (
+                f"Task Description:\n{prompt_problem}\n\n"
+                f"Current Team Plan (Subgoals):\n{prev_plan}\n"
+                f"Current Team Pass Fraction: {pf*100:.1f}%\n"
+                f"Current Team Errors (if any):\n{errs}\n\n"
+                f"Your Role (Agent {marl_agent_idx}): {action_template}\n"
+                f"Based on the task and plan, implement the core logic in a Python function `def solve(input_data: str) -> str:`.\n"
+                "Constraints:\n"
+                "- The function must take a single string `input_data` (representing stdin) and return a string (representing stdout).\n"
+                "- Do NOT use `input()` or `print()` statements inside `solve`.\n"
+                "- Output ONLY the complete Python code for the `solve` function. No extra text, explanations, or markdown markers like ```python ... ```."
+            )
+        elif action_template == "optimize-code":
+            if not prev_code.strip(): return "# Skipped optimize-code: No code to optimize."
+            body = (
+                f"Task:\n{prompt_problem}\n\n"
+                f"Code to Optimize:\n```python\n{prev_code}\n```\n"
+                f"Current Team Plan:\n{prev_plan}\n"
+                f"Current Pass fraction: {pf*100:.1f}%\n"
+                f"Observed Errors:\n{errs}\n\n"
+                f"Your Role (Agent {marl_agent_idx}): {action_template}\n"
+                f"Optimize the provided Python code for time/space complexity or readability, ensuring functionality remains identical. Output ONLY the complete optimized `solve` function code."
+            )
+        elif action_template == "self-review":
+            if not prev_code.strip(): return "# Skipped self-review: No code to review."
+            body = (
+                f"Task:\n{prompt_problem}\n\n"
+                f"Code for Review:\n```python\n{prev_code}\n```\n"
+                f"Current Pass fraction: {pf*100:.1f}%\n"
+                f"Observed Errors:\n{errs}\n\n"
+                f"Your Role (Agent {marl_agent_idx}): {action_template}\n"
+                f"Review the provided code. Identify potential logical errors, bugs, inefficiencies, or areas not adhering to the task requirements. Provide a concise review with specific, actionable suggestions."
+            )
+        elif action_template == "patch-bug":
+            if not prev_code.strip(): return "# Skipped patch-bug: No code to debug."
+            if not errs.strip() or errs.startswith("AllTestsPassed"): return "# Skipped patch-bug: No specific errors to patch or all tests passed."
+            body = (
+                f"Task:\n{prompt_problem}\n\n"
+                f"Code with Bugs:\n```python\n{prev_code}\n```\n"
+                f"Observed Errors During Testing:\n{errs}\n\n"
+                f"Your Role (Agent {marl_agent_idx}): {action_template}\n"
+                f"Fix the bugs in the provided code based on the observed errors. Output ONLY the complete corrected `solve` function code."
+            )
+        elif action_template == "unit-fix":
+            if not prev_code.strip(): return "# Skipped unit-fix: No code to fix."
+            if not errs.strip() or errs.startswith("AllTestsPassed"): return "# Skipped unit-fix: No specific errors for unit-fix or all tests passed."
+            body = (
+                f"Task:\n{prompt_problem}\n\n"
+                f"Failing Code:\n```python\n{prev_code}\n```\n"
+                f"Current Pass fraction: {pf*100:.1f}%\n"
+                f"Test Failures / Errors:\n{errs}\n\n"
+                f"Your Role (Agent {marl_agent_idx}): {action_template}\n"
+                f"Focus on fixing the specific issues highlighted by the test failures or errors to improve the pass fraction. Output ONLY the corrected `solve` function code."
+            )
+        elif action_template == "noop":
+            return "# No operation selected for this step by agent."
+        else: # Fallback for unknown action template
+            logger.warning(f"Unknown action_template in generate_llm_response_for_action: {action_template}. Using generic prompt.")
+            body = (
+                f"Task:\n{prompt_problem}\n\nTeam Code:\n```python\n{prev_code}\n```\nPlan:\n{prev_plan}\nErrors:\n{errs}\nPF: {pf*100:.1f}%\n"
+                f"Your Role (Agent {marl_agent_idx}): {action_template}\nYour Response:"
+            )
+
+        messages = [
+            {"role": "system", "content": "You are a highly skilled AI programming assistant. Follow instructions precisely. If generating code, provide only the raw Python code for the 'solve' function."},
+            {"role": "user", "content": body},
+        ]
+        
+        prompt_text_for_llm = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True) # type: ignore [union-attr]
+        
+        responses = self.call_llm_batch([prompt_text_for_llm])
+        return responses[0] if responses else f"# LLM call failed for action: {action_template}"
+
+    def call_llm_batch(self, prompt_texts: List[str]) -> List[str]:
+        """Calls the LLM in batch with a list of prompt texts."""
+        if not prompt_texts: return []
+        cfg=self.cfg
+        
+        # Ensure max_input_len is reasonable, considering tokens for generation
+        max_input_len = cfg.max_llm_input_length - cfg.max_llm_new_tokens 
+        max_input_len = max(50, max_input_len - 20) # Keep a small buffer and minimum length
+
+        inputs=self.tokenizer(
+            prompt_texts,
+            return_tensors="pt",
+            padding=True, # Pad to longest in batch
+            truncation=True,
+            max_length=max_input_len 
+        ).to(self.device) # type: ignore [union-attr]
+        
+        generation_config_dict = {
+            "max_new_tokens": cfg.max_llm_new_tokens,
+            "do_sample": False, # For deterministic output, can be True for more diverse responses
+            "pad_token_id": self.tokenizer.pad_token_id or self.tokenizer.eos_token_id, # type: ignore [union-attr]
+            "eos_token_id": self.tokenizer.eos_token_id, # type: ignore [union-attr]
+            # "temperature": 0.7, # Example if do_sample=True
+            # "top_p": 0.9,       # Example if do_sample=True
+        }
+        gen_config_obj=GenerationConfig(**generation_config_dict)
+        
+        # Determine if LLM LoRA parameters are being trained
+        is_training_llm_lora = self.opt_llm_lora is not None and self.llm_model.training
+        
+        # Enable gradients only if LLM LoRA is being trained
+        context_manager = torch.enable_grad() if is_training_llm_lora else torch.no_grad()
+        
+        with context_manager:
+            outputs = self.llm_model.generate(**inputs, generation_config=gen_config_obj) # type: ignore [operator]
+        
+        # Decode generated tokens, excluding input tokens
+        decoded_responses = [
+            self.tokenizer.decode(outputs[i, inputs.input_ids.shape[1]:], skip_special_tokens=True).strip() # type: ignore [union-attr]
+            for i in range(outputs.shape[0])
+        ]
+        return decoded_responses
+
+    def collect_rollouts(self, current_h_actor_teams_in: torch.Tensor, current_h_critic_teams_in: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Collects rollouts from all parallel environments by sequentially stepping through MARL agents.
+        This version is modified to use `env.step_agent_turn`.
+        """
+        cfg = self.cfg
+        B, Na, Nr, Dl = cfg.num_envs, cfg.num_marl_agents, cfg.N_ACTION_TEMPLATES, cfg.latent_dim
+        
+        # Detach hidden states to prevent gradients from flowing across rollout collections
+        h_actor_teams = current_h_actor_teams_in.detach().clone() # (B, Na, Drnn_a)
+        h_critic_teams = current_h_critic_teams_in.detach().clone() # (B, Drnn_c)
+
+        # `reset_all_envs` returns obs for agent 0 of each env, and global state for each env
+        # `all_envs_current_agent_loc_obs_comp` will store the obs for the *currently acting* agent in each env
+        all_envs_current_agent_loc_obs_comp, all_envs_current_team_global_state_comp = self.env.reset_all_envs()
+        # Convert to list of optionals for easier handling if an env is done early
+        all_envs_current_agent_loc_obs_comp = [obs for obs in all_envs_current_agent_loc_obs_comp]
+
+
+        self.rollout_problem_llm_responses_for_csv = [(None, "") for _ in range(B)] # For CSV logging
+
+        for t_step in range(cfg.num_steps_per_env): # Iterate over team steps
+            # Store initial hidden states for this team step
+            self.rollout_buffer["actor_hidden_states"][t_step] = h_actor_teams.clone()
+            self.rollout_buffer["critic_hidden_states"][t_step] = h_critic_teams.clone()
+
+            # Global state and critic value are determined once per team step
+            # Use global state from *before* agents act in this team step t_step
+            current_step_global_s_crit_list = []
+            current_step_global_s_inf_list = []
+            for env_idx_gs in range(B):
+                if all_envs_current_team_global_state_comp[env_idx_gs] is not None:
+                    s_c, s_i = self.get_team_global_state_embedding(all_envs_current_team_global_state_comp[env_idx_gs])
+                else: # Should happen if env was done in previous step
+                    s_c = torch.zeros(self.cfg.global_state_dim_for_critic, device=self.device)
+                    s_i = torch.zeros(self.cfg.global_state_dim_for_inference, device=self.device)
+                current_step_global_s_crit_list.append(s_c)
+                current_step_global_s_inf_list.append(s_i)
+            
+            stacked_global_s_crit = torch.stack(current_step_global_s_crit_list)
+            self.rollout_buffer["global_state_embeddings_critic"][t_step] = stacked_global_s_crit
+            self.rollout_buffer["global_state_embeddings_inference"][t_step] = torch.stack(current_step_global_s_inf_list)
+
+            with torch.no_grad():
+                team_values_at_t, h_critic_next_for_buffer = self.critic_net(stacked_global_s_crit, h_critic_teams)
+            self.rollout_buffer["team_values"][t_step] = team_values_at_t.detach()
+            # h_critic_teams will be updated with h_critic_next_for_buffer at end of team step loop
+
+            # Temp storage for this team_step's agent data before adding to buffer
+            # Batch first: (B, Na, ...)
+            current_t_step_loc_obs_embeddings_list: List[torch.Tensor] = [torch.zeros(Na, cfg.obs_embed_dim, device=self.device) for _ in range(B)]
+            current_t_step_latents_z_list: List[torch.Tensor] = [torch.zeros(Na, Nr, Dl, device=self.device) for _ in range(B)]
+            current_t_step_latents_mu_list: List[torch.Tensor] = [torch.zeros(Na, Nr, Dl, device=self.device) for _ in range(B)]
+            current_t_step_latents_sigma_list: List[torch.Tensor] = [torch.zeros(Na, Nr, Dl, device=self.device) for _ in range(B)]
+            current_t_step_actions_list: List[torch.Tensor] = [torch.zeros(Na, dtype=torch.long, device=self.device) for _ in range(B)]
+            current_t_step_log_probs_list: List[torch.Tensor] = [torch.zeros(Na, device=self.device) for _ in range(B)]
+
+            # This will store the global state after the team step, for the next iteration's critic input
+            next_team_global_states_for_next_iteration = [None for _ in range(B)] 
+
+            for env_idx in range(B):
+                if self.env.env_states[env_idx].get("episode_done", False) and t_step > 0 : # If episode already marked done
+                    self.rollout_buffer["team_rewards"][t_step, env_idx] = 0.0
+                    self.rollout_buffer["team_dones"][t_step, env_idx] = True
+                    # Fill with placeholder/last known obs if needed, or ensure networks handle None inputs if possible
+                    # For now, we will let them be zeros in the buffer if an env is done.
+                    if self.rollout_problem_llm_responses_for_csv[env_idx][0] is None:
+                         self.rollout_problem_llm_responses_for_csv[env_idx] = (self.env.env_states[env_idx].get('task_data',{}), "#DoneEarlierInRollout")
+                    next_team_global_states_for_next_iteration[env_idx] = all_envs_current_team_global_state_comp[env_idx] # Carry over
+                    continue
+
+                # Sequential agent turns within this env_idx for this t_step
+                for agent_idx_turn in range(Na):
+                    current_agent_loc_obs_comp = all_envs_current_agent_loc_obs_comp[env_idx]
+                    if current_agent_loc_obs_comp is None : # Should not happen if episode_done is handled
+                         # This agent's turn is skipped or episode ended mid-team-step (unlikely with current env logic)
+                         # Fill with placeholders
+                        current_t_step_loc_obs_embeddings_list[env_idx][agent_idx_turn, :] = torch.zeros(cfg.obs_embed_dim, device=self.device)
+                        # ... other placeholders for latents, actions, log_probs
+                        llm_response_str = "#AgentObsNone"
+                        action_template_str = cfg.ACTION_TEMPLATES[-1] # noop
+                    else:
+                        loc_obs_emb = self.get_agent_observation_embedding(current_agent_loc_obs_comp)
+                        current_t_step_loc_obs_embeddings_list[env_idx][agent_idx_turn, :] = loc_obs_emb
+                        
+                        h_actor_current_agent_for_env = h_actor_teams[env_idx, agent_idx_turn, :].unsqueeze(0) # (1, Drnn_a)
+                        loc_obs_emb_unsqueezed = loc_obs_emb.unsqueeze(0) # (1, Da_loc)
+
+                        self.actor_net.eval(); self.latent_net.eval() # Ensure eval mode for rollout
+                        with torch.no_grad():
+                            z_roles, mu_roles, sig_roles = self.latent_net(loc_obs_emb_unsqueezed, h_actor_current_agent_for_env)
+                            logits, h_actor_next_agent_for_env, _ = self.actor_net(loc_obs_emb_unsqueezed, h_actor_current_agent_for_env, z_roles)
+                        
+                        dist = torch.distributions.Categorical(logits=logits)
+                        action_selected_idx_tensor = dist.sample()
+                        action_selected_idx = action_selected_idx_tensor.item()
+                        log_prob_selected = dist.log_prob(action_selected_idx_tensor).item()
+
+                        current_t_step_latents_z_list[env_idx][agent_idx_turn,:,:] = z_roles.squeeze(0)
+                        current_t_step_latents_mu_list[env_idx][agent_idx_turn,:,:] = mu_roles.squeeze(0)
+                        current_t_step_latents_sigma_list[env_idx][agent_idx_turn,:,:] = sig_roles.squeeze(0)
+                        current_t_step_actions_list[env_idx][agent_idx_turn] = action_selected_idx
+                        current_t_step_log_probs_list[env_idx][agent_idx_turn] = log_prob_selected
+                        h_actor_teams[env_idx, agent_idx_turn, :] = h_actor_next_agent_for_env.squeeze(0) # Update hidden state for this agent
+
+                        action_template_str = cfg.ACTION_TEMPLATES[action_selected_idx]
+                        llm_response_str = self.generate_llm_response_for_action(current_agent_loc_obs_comp, action_template_str)
+                    
+                    # Call env.step_agent_turn for the current agent
+                    next_obs_for_next_agent, team_glob_s_after_agent_turn, team_rew, team_done, is_next_turn, info = \
+                        self.env.step_agent_turn(env_idx, action_template_str, llm_response_str)
+
+                    all_envs_current_agent_loc_obs_comp[env_idx] = next_obs_for_next_agent # This is obs for next agent or agent 0 of next step
+                    all_envs_current_team_global_state_comp[env_idx] = team_glob_s_after_agent_turn # Update global state after each agent
+                    next_team_global_states_for_next_iteration[env_idx] = team_glob_s_after_agent_turn # Store the latest
+
+                    if not is_next_turn: # Team step finished for this environment
+                        self.rollout_buffer["team_rewards"][t_step, env_idx] = team_rew
+                        self.rollout_buffer["team_dones"][t_step, env_idx] = team_done
+                        if team_done and self.rollout_problem_llm_responses_for_csv[env_idx][0] is None:
+                            task_data_csv = self.env.env_states[env_idx].get('task_data', {})
+                            final_code_csv = self.env.env_states[env_idx].get("team_overall_code", "#TeamStepEndInRollout")
+                            self.rollout_problem_llm_responses_for_csv[env_idx] = (task_data_csv, final_code_csv)
+                        break # Move to the next environment for this t_step
+
+            # After all agent turns for all envs (or team step ends)
+            self.rollout_buffer["local_obs_embeddings"][t_step] = torch.stack(current_t_step_loc_obs_embeddings_list)
+            self.rollout_buffer["latents_z_all_roles"][t_step] = torch.stack(current_t_step_latents_z_list)
+            self.rollout_buffer["latents_mu_all_roles"][t_step] = torch.stack(current_t_step_latents_mu_list)
+            self.rollout_buffer["latents_sigma_all_roles"][t_step] = torch.stack(current_t_step_latents_sigma_list)
+            self.rollout_buffer["actions"][t_step] = torch.stack(current_t_step_actions_list)
+            self.rollout_buffer["log_probs"][t_step] = torch.stack(current_t_step_log_probs_list)
+            
+            h_critic_teams = h_critic_next_for_buffer.detach() # Update critic hidden state for next team step
+            all_envs_current_team_global_state_comp = next_team_global_states_for_next_iteration # Carry over global state for next iteration's critic input
+
+        # After all t_steps in rollout are done
+        for env_idx_csv_final in range(B): # Log any remaining non-done episodes for CSV
+            if self.rollout_problem_llm_responses_for_csv[env_idx_csv_final][0] is None: 
+                 task_data_csv = self.env.env_states[env_idx_csv_final].get('task_data', {})
+                 final_code_csv = self.env.env_states[env_idx_csv_final].get("team_overall_code", "#RolloutEndedWithoutDone")
+                 self.rollout_problem_llm_responses_for_csv[env_idx_csv_final] = (task_data_csv, final_code_csv)
+        
+        eval_data_for_csv_final: List[Tuple[Dict[str, Any], str]] = []
+        for task_data_item, code_str_item in self.rollout_problem_llm_responses_for_csv:
+            if task_data_item: eval_data_for_csv_final.append((task_data_item, code_str_item))
+
+        if eval_data_for_csv_final:
+            self.env.run_evaluation_and_save_csv(eval_data_for_csv_final, cfg.execution_results_csv_path)
+        
+        # Get the value of the state S_T for GAE calculation
+        # This uses the global state after the last team step (all_envs_current_team_global_state_comp)
+        last_glob_s_T_crit_list = []
+        for env_idx_gae_last in range(B):
+            gs_comp = all_envs_current_team_global_state_comp[env_idx_gae_last]
+            if gs_comp is not None and not self.rollout_buffer["team_dones"][cfg.num_steps_per_env -1, env_idx_gae_last]: # If not done
+                 s_c_last, _ = self.get_team_global_state_embedding(gs_comp)
+            else: # If done or None, value is 0
+                 s_c_last = torch.zeros(self.cfg.global_state_dim_for_critic, device=self.device) # Effectively makes V(S_T)=0 if done
+            last_glob_s_T_crit_list.append(s_c_last)
+        
+        last_glob_s_T_crit_tensor = torch.stack(last_glob_s_T_crit_list)
+        with torch.no_grad(): 
+            last_team_values_for_gae, _ = self.critic_net(last_glob_s_T_crit_tensor, h_critic_teams)
+            # Mask out values for episodes that were already done at the last step of rollout
+            last_done_mask = self.rollout_buffer["team_dones"][cfg.num_steps_per_env -1].float() # 1.0 if done, 0.0 if not
+            last_team_values_for_gae = last_team_values_for_gae * (1.0 - last_done_mask)
+
+
+        return h_actor_teams, h_critic_teams, last_team_values_for_gae
+
+
+    def compute_advantages_and_returns(self, last_team_values_for_gae: torch.Tensor):
+        """Computes advantages and returns using GAE for team-level rewards."""
+        team_advantages = torch.zeros_like(self.rollout_buffer["team_rewards"], device=self.device)
+        gae_lambda, gamma = self.cfg.gae_lambda, self.cfg.gamma
+        last_gae_lam_team = torch.zeros(self.cfg.num_envs, device=self.device)
+
+        for t in reversed(range(self.cfg.num_steps_per_env)):
+            if t == self.cfg.num_steps_per_env - 1:
+                next_non_terminal_team = 1.0 - self.rollout_buffer["team_dones"][t].float() # If current is last, next_done is current_done for V(S_T+1)
+                next_team_values = last_team_values_for_gae # V(S_T)
+            else:
+                next_non_terminal_team = 1.0 - self.rollout_buffer["team_dones"][t + 1].float() # 1 if not done, 0 if done
+                next_team_values = self.rollout_buffer["team_values"][t + 1] # V(S_t+1)
+            
+            # TD error: delta_t = r_t + gamma * V(S_t+1) * (1-done_t+1) - V(S_t)
+            delta_team = self.rollout_buffer["team_rewards"][t] + \
+                         gamma * next_team_values * next_non_terminal_team - \
+                         self.rollout_buffer["team_values"][t]
+            
+            # GAE: A_t = delta_t + gamma * lambda * A_t+1 * (1-done_t+1)
+            team_advantages[t] = last_gae_lam_team = delta_team + \
+                                   gamma * gae_lambda * next_non_terminal_team * last_gae_lam_team
+        
+        # Returns R_t = A_t + V(S_t)
+        team_returns = team_advantages + self.rollout_buffer["team_values"]
+        
+        # Expand team advantages/returns for each agent (as all agents in a team share this)
+        advantages_per_agent = team_advantages.unsqueeze(-1).repeat(1, 1, self.cfg.num_marl_agents)
+        returns_per_agent_actor_target = team_returns.unsqueeze(-1).repeat(1, 1, self.cfg.num_marl_agents)
+        
+        return advantages_per_agent, returns_per_agent_actor_target, team_returns # team_returns is for critic/inference target
+
+    def ppo_update(self, advantages_agent_flat: torch.Tensor, returns_agent_actor_target_flat: torch.Tensor,
+                        local_obs_flat: torch.Tensor, 
+                        global_states_critic_flat_team: torch.Tensor, global_states_inference_flat_team: torch.Tensor,
+                        actor_h_flat: torch.Tensor, critic_h_team_flat: torch.Tensor,
+                        actions_agent_flat: torch.Tensor, log_probs_old_agent_flat: torch.Tensor,
+                        team_returns_flat_target_critic_inf: torch.Tensor, team_values_old_flat_for_clip: torch.Tensor ):
+        """Performs PPO updates for Actor, Critic, LatentNet, and InferenceNet."""
+        cfg, device = self.cfg, self.device
+        num_agent_samples_total = local_obs_flat.shape[0]
+        num_team_samples_total = global_states_critic_flat_team.shape[0]
+
+        if cfg.norm_adv: 
+            advantages_agent_flat = (advantages_agent_flat - advantages_agent_flat.mean()) / (advantages_agent_flat.std() + 1e-9)
+        
+        # Calculate minibatch sizes based on total samples and num_minibatches from config
+        # Agent samples are (num_envs * num_steps_per_env * num_marl_agents)
+        # Team samples are (num_envs * num_steps_per_env)
+        
+        # Minibatch size for agent-specific data (Actor, parts of LatentNet)
+        agent_data_minibatch_size = num_agent_samples_total // cfg.num_minibatches
+        # Minibatch size for team-specific data (Critic, InferenceNet, parts of LatentNet)
+        team_data_minibatch_size = num_team_samples_total // cfg.num_minibatches
+
+
+        if agent_data_minibatch_size == 0 or team_data_minibatch_size == 0:
+            logger.warning("Minibatch size is 0, skipping PPO update. Check num_minibatches and rollout buffer size.")
+            return
+
+        for _ in range(cfg.ppo_epochs):
+            perm_agent_indices = torch.randperm(num_agent_samples_total, device=device)
+            perm_team_indices = torch.randperm(num_team_samples_total, device=device)
+            
+            # --- Actor and LLM LoRA Update ---
+            for start_idx in range(0, num_agent_samples_total, agent_data_minibatch_size):
+                end_idx = min(start_idx + agent_data_minibatch_size, num_agent_samples_total)
+                mb_agent_indices = perm_agent_indices[start_idx:end_idx]
+                if mb_agent_indices.numel() == 0: continue
+
+                obs_mb_loc = local_obs_flat[mb_agent_indices]
+                h_actor_mb = actor_h_flat[mb_agent_indices]
+                actions_mb_agent = actions_agent_flat[mb_agent_indices]
+                old_log_probs_mb_agent = log_probs_old_agent_flat[mb_agent_indices]
+                adv_mb_agent = advantages_agent_flat[mb_agent_indices]
+                # returns_mb_actor_target = returns_agent_actor_target_flat[mb_agent_indices] # Not directly used in PPO actor loss like this
+                
+                # For Actor loss, latents are generated but detached, as actor doesn't train LatentNet
+                with torch.no_grad(): 
+                    z_roles_for_policy, _, _ = self.latent_net(obs_mb_loc, h_actor_mb)
+                
+                current_logits, _, _ = self.actor_net(obs_mb_loc, h_actor_mb, z_roles_for_policy)
+                current_dist = torch.distributions.Categorical(logits=current_logits)
+                new_log_probs_agent = current_dist.log_prob(actions_mb_agent)
+                entropy_bonus_actor = current_dist.entropy().mean()
+
+                # PPO Actor Loss (Clipped Surrogate Objective)
+                ratio = torch.exp(new_log_probs_agent - old_log_probs_mb_agent)
+                surr1 = ratio * adv_mb_agent
+                surr2 = torch.clamp(ratio, 1 - cfg.clip_coef, 1 + cfg.clip_coef) * adv_mb_agent
+                policy_loss_agent = -torch.min(surr1, surr2).mean()
+                
+                actor_loss_total = policy_loss_agent - cfg.ent_coef * entropy_bonus_actor
+                
+                # Optimize Actor and LLM LoRA
+                self.opt_actor.zero_grad()
+                if self.opt_llm_lora: self.opt_llm_lora.zero_grad()
+                
+                actor_loss_total.backward() 
+                
+                actor_params_to_clip = list(self.actor_net.parameters())
+                if not isinstance(self.state_projection_layer, nn.Identity):
+                    actor_params_to_clip += list(self.state_projection_layer.parameters())
+                if cfg.max_grad_norm > 0:
+                    nn.utils.clip_grad_norm_(actor_params_to_clip, cfg.max_grad_norm)
+                
+                if self.opt_llm_lora:
+                    llm_lora_grad_params = [p for p in self.llm_model.parameters() if p.requires_grad and p.grad is not None]
+                    if llm_lora_grad_params and cfg.max_grad_norm > 0:
+                         nn.utils.clip_grad_norm_(llm_lora_grad_params, cfg.max_grad_norm)
+                    self.opt_llm_lora.step()
+                self.opt_actor.step()
+
+            # --- Critic, LatentNet, InferenceNet Updates (Iterate over team minibatches) ---
+            for start_idx in range(0, num_team_samples_total, team_data_minibatch_size):
+                end_idx = min(start_idx + team_data_minibatch_size, num_team_samples_total)
+                mb_team_indices = perm_team_indices[start_idx:end_idx]
+                if mb_team_indices.numel() == 0: continue
+                
+                # Data for Critic
+                gs_critic_mb = global_states_critic_flat_team[mb_team_indices]
+                h_critic_mb_team = critic_h_team_flat[mb_team_indices]
+                returns_mb_team_target_critic = team_returns_flat_target_critic_inf[mb_team_indices]
+                
+                # --- Critic Loss ---
+                current_team_values, _ = self.critic_net(gs_critic_mb, h_critic_mb_team)
+                values_pred_squeezed = current_team_values.squeeze() if current_team_values.ndim > 1 else current_team_values
+
+                if cfg.clip_vloss:
+                    values_old_team_mb = team_values_old_flat_for_clip[mb_team_indices]
+                    values_pred_clipped = values_old_team_mb + torch.clamp(
+                        values_pred_squeezed - values_old_team_mb, -cfg.clip_coef, cfg.clip_coef
+                    )
+                    vf_loss_unclipped = F.mse_loss(values_pred_squeezed, returns_mb_team_target_critic)
+                    vf_loss_clipped = F.mse_loss(values_pred_clipped, returns_mb_team_target_critic)
+                    critic_loss = torch.max(vf_loss_unclipped, vf_loss_clipped).mean()
+                else:
+                    critic_loss = F.mse_loss(values_pred_squeezed, returns_mb_team_target_critic).mean()
+                
+                critic_loss_final = critic_loss * cfg.vf_coef
+                
+                self.opt_critic.zero_grad()
+                critic_loss_final.backward()
+                if cfg.max_grad_norm > 0:
+                    nn.utils.clip_grad_norm_(self.critic_net.parameters(), cfg.max_grad_norm)
+                self.opt_critic.step()
+                
+                # --- LatentNet and InferenceNet Losses ---
+                # Need to map team minibatch indices to corresponding agent minibatch indices
+                # Each team sample corresponds to Na agent samples.
+                agent_indices_for_lat_inf_list = []
+                for team_idx_val in mb_team_indices.tolist(): # Iterate over the actual index values
+                    # team_idx_val is an index into the *original* S*B flattened team data
+                    # It refers to the (team_idx_val)-th team step in the rollout
+                    # We need the agent data from local_obs_flat, actor_h_flat that corresponds to this team step.
+                    # If local_obs_flat is (S*B*Na, ...), and team_idx_val is from 0 to S*B-1,
+                    # then agents for team_idx_val are at indices:
+                    # team_idx_val * Na, team_idx_val * Na + 1, ..., team_idx_val * Na + Na - 1
+                    for agent_i in range(cfg.num_marl_agents):
+                        agent_indices_for_lat_inf_list.append(team_idx_val * cfg.num_marl_agents + agent_i)
+                
+                mb_agent_indices_for_lat_inf = torch.tensor(agent_indices_for_lat_inf_list, device=device, dtype=torch.long)
+                if mb_agent_indices_for_lat_inf.numel() == 0: continue
+
+                obs_mb_loc_for_lat = local_obs_flat[mb_agent_indices_for_lat_inf]
+                h_actor_mb_for_lat = actor_h_flat[mb_agent_indices_for_lat_inf]
+                gs_inference_mb = global_states_inference_flat_team[mb_team_indices] # Global state for these team steps
+                returns_mb_team_target_inf = team_returns_flat_target_critic_inf[mb_team_indices] # Same target as critic for V_I
+
+                # --- LatentNet Loss (Eq. 10 in SHPPO paper [cite: 182]) ---
+                # LatentNet forward pass to get latents with gradients
+                # z_latents: (MB_team*Na, Nr, Dl), mu_latents: (MB_team*Na, Nr, Dl), sigma_latents: (MB_team*Na, Nr, Dl)
+                z_latents, mu_latents, sigma_latents = self.latent_net(obs_mb_loc_for_lat, h_actor_mb_for_lat)
+                
+                # L_e: Mean entropy of latent distributions (Eq. 7 [cite: 177]) - to be minimized
+                # Gaussian entropy: 0.5 * k * (1 + log(2*pi)) + sum(log(sigma_j))
+                latent_entropy = (0.5 * cfg.latent_dim * (1 + math.log(2 * math.pi)) + torch.log(sigma_latents + 1e-9).sum(dim=-1)).mean()
+                
+                # L_d: Diversity of latent variables (Eq. 8 [cite: 179]) - to be maximized
+                # cosine_diversity already computes mean distance (1-similarity)
+                latent_diversity = cosine_diversity(z_latents) # z_latents shape (Batch_Size_Combined, Num_Roles, Latent_Dim)
+                
+                # L_v: Guidance from InferenceNet (Eq. 6 [cite: 173]) - V_I to be maximized
+                # Reshape mu and sigma for InferenceNet: (MB_team, Na, Nr, Dl)
+                current_minibatch_team_size = mb_team_indices.size(0)
+                mu_latents_team_view = mu_latents.view(current_minibatch_team_size, cfg.num_marl_agents, cfg.N_ACTION_TEMPLATES, cfg.latent_dim)
+                sigma_latents_team_view = sigma_latents.view(current_minibatch_team_size, cfg.num_marl_agents, cfg.N_ACTION_TEMPLATES, cfg.latent_dim)
+                
+                # V_I prediction for LatentNet loss (gradients should flow to LatentNet, not InferenceNet here)
+                # InferenceNet parameters are fixed when updating LatentNet [cite: 174]
+                # This is achieved by not calling opt_inference.step() with this loss.
+                V_I_for_latent_loss = self.inference_net(gs_inference_mb, mu_latents_team_view, sigma_latents_team_view)
+                
+                # LatentNet Loss: Minimize -V_I + lambda_e * L_e - lambda_d * L_d
+                loss_latent_net = -V_I_for_latent_loss.mean() + \
+                                  cfg.lambda_e_latent * latent_entropy - \
+                                  cfg.lambda_d_latent * latent_diversity
+                
+                self.opt_latent.zero_grad()
+                loss_latent_net.backward() # This computes grads for LatentNet and InferenceNet params
+                if cfg.max_grad_norm > 0: 
+                    nn.utils.clip_grad_norm_(self.latent_net.parameters(), cfg.max_grad_norm)
+                self.opt_latent.step() # Only LatentNet parameters are updated
+
+                # --- InferenceNet Loss (Eq. 11 in SHPPO paper [cite: 184, 191]) ---
+                # Use detached mu and sigma from LatentNet for InferenceNet's own update
+                # This prevents InferenceNet's loss from directly backpropagating into LatentNet during this step.
+                mu_latents_team_view_detached = mu_latents_team_view.detach()
+                sigma_latents_team_view_detached = sigma_latents_team_view.detach()
+                
+                V_I_for_inference_loss = self.inference_net(gs_inference_mb, mu_latents_team_view_detached, sigma_latents_team_view_detached)
+                loss_inference_net = F.mse_loss(V_I_for_inference_loss.squeeze(), returns_mb_team_target_inf) * cfg.lambda_inf_mse
+                
+                self.opt_inference.zero_grad() # Zero out grads from LatentNet's backward pass on InferenceNet params
+                loss_inference_net.backward()
+                if cfg.max_grad_norm > 0:
+                    nn.utils.clip_grad_norm_(self.inference_net.parameters(), cfg.max_grad_norm)
+                self.opt_inference.step()
+
+
+    def train(self, total_timesteps_override: Optional[int] = None):
+        """Main training loop."""
+        cfg=self.cfg
+        total_training_team_steps = total_timesteps_override if total_timesteps_override is not None else cfg.total_timesteps
+        
+        if cfg.wandb_project_name:
+            try:
+                wandb.init(project=cfg.wandb_project_name, name=cfg.wandb_run_name, config=vars(cfg), reinit=True)
+            except Exception as e:
+                logger.error(f"WandB initialization failed: {e}. Disabling WandB.")
+                cfg.wandb_project_name = None 
+        
+        # Initial hidden states for actors (per agent) and critic (per team)
+        next_h_actor_teams = torch.zeros(cfg.num_envs, cfg.num_marl_agents, cfg.actor_rnn_hidden_dim, device=self.device)
+        next_h_critic_teams = torch.zeros(cfg.num_envs, cfg.critic_rnn_hidden_dim, device=self.device)
+        
+        num_team_steps_per_update = cfg.num_envs * cfg.num_steps_per_env
+        if num_team_steps_per_update == 0 :
+            logger.error("num_envs * num_steps_per_env is 0. Cannot collect rollouts for training.")
+            return
+            
+        num_total_updates = total_training_team_steps // num_team_steps_per_update
+
+        if num_total_updates == 0:
+            logger.warning(f"Not enough total_timesteps ({total_training_team_steps}) for a single PPO update cycle ({num_team_steps_per_update} steps needed). Training will not start.")
+            return
+            
+        logger.info(f"Starting training for {num_total_updates} PPO update cycles ({total_training_team_steps} total team environment steps).")
+        
+        for update_cycle_idx in range(1, num_total_updates + 1):
+            current_total_env_steps = update_cycle_idx * num_team_steps_per_update
+            
+            # Set networks to evaluation mode for rollout collection
+            if self.opt_llm_lora: self.llm_model.eval()
+            self.actor_net.eval(); self.critic_net.eval(); self.latent_net.eval(); self.inference_net.eval()
+            if not isinstance(self.state_projection_layer, nn.Identity): self.state_projection_layer.eval()
+
+            # Collect rollouts using the current policy
+            h_actor_end_rollout, h_critic_end_rollout, last_team_values_gae = self.collect_rollouts(next_h_actor_teams, next_h_critic_teams)
+            
+            # Compute advantages and returns
+            adv_agent, ret_agent_actor_tgt, team_ret_crit_inf_tgt = self.compute_advantages_and_returns(last_team_values_gae)
+            
+            # Set networks to training mode for PPO update
+            self.actor_net.train(); self.critic_net.train(); self.latent_net.train(); self.inference_net.train()
+            if self.opt_llm_lora: self.llm_model.train()
+            if not isinstance(self.state_projection_layer, nn.Identity): self.state_projection_layer.train()
+            
+            # Reshape data from rollout buffer for PPO update
+            # S=num_steps_per_env, B=num_envs, Na=num_marl_agents
+            total_agent_samples_in_rollout = cfg.num_steps_per_env * cfg.num_envs * cfg.num_marl_agents
+            total_team_samples_in_rollout = cfg.num_steps_per_env * cfg.num_envs
+            
+            flat_local_obs = self.rollout_buffer["local_obs_embeddings"].reshape(total_agent_samples_in_rollout, cfg.obs_embed_dim)
+            flat_actor_h = self.rollout_buffer["actor_hidden_states"].reshape(total_agent_samples_in_rollout, cfg.actor_rnn_hidden_dim)
+            flat_actions_agent = self.rollout_buffer["actions"].reshape(total_agent_samples_in_rollout)
+            flat_log_probs_old_agent = self.rollout_buffer["log_probs"].reshape(total_agent_samples_in_rollout)
+            flat_adv_agent = adv_agent.reshape(total_agent_samples_in_rollout)
+            flat_ret_agent_actor_tgt = ret_agent_actor_tgt.reshape(total_agent_samples_in_rollout)
+            
+            flat_global_states_critic_team = self.rollout_buffer["global_state_embeddings_critic"].reshape(total_team_samples_in_rollout, cfg.global_state_dim_for_critic)
+            flat_global_states_inference_team = self.rollout_buffer["global_state_embeddings_inference"].reshape(total_team_samples_in_rollout, cfg.global_state_dim_for_inference)
+            flat_critic_h_team = self.rollout_buffer["critic_hidden_states"].reshape(total_team_samples_in_rollout, cfg.critic_rnn_hidden_dim)
+            flat_team_returns_target_critic_inf = team_ret_crit_inf_tgt.reshape(total_team_samples_in_rollout)
+            flat_team_values_old_for_clip = self.rollout_buffer["team_values"].reshape(total_team_samples_in_rollout).detach().clone()
+            
+            # Perform PPO update
+            self.ppo_update(
+                flat_adv_agent, flat_ret_agent_actor_tgt, flat_local_obs, 
+                flat_global_states_critic_team, flat_global_states_inference_team,
+                flat_actor_h, flat_critic_h_team,
+                flat_actions_agent, flat_log_probs_old_agent,
+                flat_team_returns_target_critic_inf, flat_team_values_old_for_clip
+            )
+            
+            # Update hidden states for the next rollout collection
+            next_h_actor_teams = h_actor_end_rollout.detach()
+            next_h_critic_teams = h_critic_end_rollout.detach()
+            
+            avg_rollout_team_reward = self.rollout_buffer["team_rewards"].mean().item()
+            if cfg.wandb_project_name and wandb.run:
+                wandb.log({
+                    "rollout/avg_team_reward": avg_rollout_team_reward,
+                    "global_step": current_total_env_steps,
+                    "update_cycle": update_cycle_idx
+                })
+                
+            if update_cycle_idx % 10 == 0:
+                logger.info(f"[Update {update_cycle_idx}/{num_total_updates}, EnvTeamSteps {current_total_env_steps}] Avg Team Rollout Reward: {avg_rollout_team_reward:.3f}")
+            
+            if update_cycle_idx > 0 and update_cycle_idx % cfg.evaluate_interval == 0:
+                self.evaluate_model(current_total_env_steps)
+            
+            if update_cycle_idx > 0 and update_cycle_idx % (cfg.evaluate_interval * 10) == 0: # More frequent checkpoint saving
+                self.save_models(f"shppo_checkpoint_update_{update_cycle_idx}")
+                
+        logger.info("Training complete.")
+        self.save_models("shppo_final_model")
+        if cfg.wandb_project_name and wandb.run:
+            wandb.finish()
+
+    def evaluate_model(self, current_global_step: int, eval_csv_filepath: Optional[str] = None):
+        """Evaluates the current model deterministically on a subset of tasks."""
+        cfg = self.cfg
+        log_path = eval_csv_filepath if eval_csv_filepath else f"eval_results_step_{current_global_step}.csv"
+        logger.info(f"\n--- Evaluation at Global Step {current_global_step}, saving results to {log_path} ---")
+        
+        # Set all networks to evaluation mode
+        self.actor_net.eval(); self.latent_net.eval(); self.critic_net.eval(); self.inference_net.eval()
+        if self.opt_llm_lora: self.llm_model.eval()
+        if not isinstance(self.state_projection_layer, nn.Identity): self.state_projection_layer.eval()
+        
+        num_eval_problems_to_run = min(cfg.evaluate_episodes, len(self.env.all_problem_tasks))
+        if num_eval_problems_to_run == 0:
+            logger.info("No problems available or configured for evaluation.")
+            return
+            
+        # Sample problems for evaluation
+        eval_problem_indices = random.sample(range(len(self.env.all_problem_tasks)), num_eval_problems_to_run)
+        
+        all_episode_team_rewards: List[float] = []
+        all_episode_team_pass_fractions: List[float] = []
+        problem_task_code_pairs_for_csv: List[Tuple[Dict[str, Any], str]] = []
+        
+        # Evaluation is done one environment at a time (env_idx 0 of the SHPPOCodeEnv instance)
+        eval_env_idx = 0 
+
+        for i in range(num_eval_problems_to_run):
+            problem_task_for_eval = self.env.all_problem_tasks[eval_problem_indices[i]]
+            logger.info(f"Evaluating task: {problem_task_for_eval.get('name', 'Unknown Task')}")
+
+            # Reset and initialize the single evaluation environment (env_idx 0)
+            # _reset_one_env returns (first_agent_loc_obs_comps, global_state_comps)
+            current_agent_loc_obs_comp_eval, current_team_global_state_comp_eval = \
+                self.env._reset_one_env(eval_env_idx, problem_task_for_eval)
+
+            # Initialize actor hidden states for all agents in this eval environment
+            h_actor_eval_env = torch.zeros(1, cfg.num_marl_agents, cfg.actor_rnn_hidden_dim, device=self.device) # Batch_size=1 for eval env
+
+            episode_team_reward = 0.0
+            final_code_for_this_eval_episode = ""
+
+            for _ in range(cfg.max_team_episode_steps): # Iterate through team steps for the episode
+                if self.env.env_states[eval_env_idx].get("episode_done", False):
+                    break # Episode finished for this task
+
+                # Sequential agent turns within this team step
+                for agent_idx_turn_eval in range(cfg.num_marl_agents):
+                    if current_agent_loc_obs_comp_eval is None: # Should not happen if episode_done is checked
+                        action_str_eval = cfg.ACTION_TEMPLATES[-1] # noop
+                        llm_response_eval = "#EvalAgentObsNone"
+                    else:
+                        loc_obs_emb_eval = self.get_agent_observation_embedding(current_agent_loc_obs_comp_eval).unsqueeze(0) # Add batch dim
+                        h_actor_this_agent_eval = h_actor_eval_env[0, agent_idx_turn_eval, :].unsqueeze(0) # (1, Drnn_a)
+                        
+                        with torch.no_grad():
+                            # Latents are still generated, as HeteLayer depends on them
+                            z_roles_eval, _, _ = self.latent_net(loc_obs_emb_eval, h_actor_this_agent_eval)
+                            # Use argmax for deterministic action selection during evaluation
+                            logits_eval, h_actor_next_unsqueeze_eval, _ = self.actor_net(loc_obs_emb_eval, h_actor_this_agent_eval, z_roles_eval)
+                        
+                        action_idx_eval = torch.argmax(logits_eval, dim=1).item()
+                        action_str_eval = cfg.ACTION_TEMPLATES[action_idx_eval]
+                        
+                        # Update this agent's hidden state for the next time it acts (if RNN state is per agent)
+                        h_actor_eval_env[0, agent_idx_turn_eval, :] = h_actor_next_unsqueeze_eval.squeeze(0).detach()
+                        
+                        llm_response_eval = self.generate_llm_response_for_action(
+                            agent_local_obs_components=current_agent_loc_obs_comp_eval,
+                            action_template=action_str_eval
+                        )
+                    
+                    # Step the environment for this single agent's turn
+                    next_obs_for_next_agent_eval, team_glob_s_after_agent_turn_eval, \
+                    team_reward_this_turn_eval, team_done_this_episode_eval, \
+                    is_next_turn_in_team_eval, info_eval = \
+                        self.env.step_agent_turn(eval_env_idx, action_str_eval, llm_response_eval)
+                    
+                    current_agent_loc_obs_comp_eval = next_obs_for_next_agent_eval # Update obs for next agent / next step's agent 0
+                    current_team_global_state_comp_eval = team_glob_s_after_agent_turn_eval
+
+                    if not is_next_turn_in_team_eval: # Team step concluded
+                        episode_team_reward += team_reward_this_turn_eval
+                        final_code_for_this_eval_episode = self.env.env_states[eval_env_idx].get("team_overall_code", "")
+                        if team_done_this_episode_eval:
+                            break # Break from agent_idx_turn loop, then outer team_step loop will also break due to episode_done
+                
+                if self.env.env_states[eval_env_idx].get("episode_done", False): # Check again after team step
+                    break
+            
+            all_episode_team_rewards.append(episode_team_reward)
+            all_episode_team_pass_fractions.append(self.env.env_states[eval_env_idx].get("team_current_pass_fraction", 0.0))
+            problem_task_code_pairs_for_csv.append((problem_task_for_eval, final_code_for_this_eval_episode))
+        
+        if problem_task_code_pairs_for_csv:
+            self.env.run_evaluation_and_save_csv(problem_task_code_pairs_for_csv, log_path)
+            
+        avg_team_pass_fraction_eval = np.mean(all_episode_team_pass_fractions) if all_episode_team_pass_fractions else 0.0
+        avg_team_reward_eval = np.mean(all_episode_team_rewards) if all_episode_team_rewards else 0.0
+        
+        logger.info(f"Evaluation Summary: Avg Team Pass Fraction = {avg_team_pass_fraction_eval:.3f}, Avg Team Reward = {avg_team_reward_eval:.3f}")
+        if cfg.wandb_project_name and wandb.run:
+            wandb.log({
+                "eval/avg_team_pass_fraction": avg_team_pass_fraction_eval,
+                "eval/avg_team_reward": avg_team_reward_eval,
+                "global_step": current_global_step
+            })
+        logger.info("--- End Evaluation ---")
+
+    def save_models(self, path_prefix: str ="shppo_model"):
+        """Saves all network models and LoRA adapters."""
+        os.makedirs(path_prefix, exist_ok=True)
+        torch.save(self.actor_net.state_dict(), os.path.join(path_prefix, "actor_net.pth"))
+        torch.save(self.critic_net.state_dict(), os.path.join(path_prefix, "critic_net.pth"))
+        torch.save(self.latent_net.state_dict(), os.path.join(path_prefix, "latent_net.pth"))
+        torch.save(self.inference_net.state_dict(), os.path.join(path_prefix, "inference_net.pth"))
+        
+        if not isinstance(self.state_projection_layer, nn.Identity):
+            torch.save(self.state_projection_layer.state_dict(), os.path.join(path_prefix, "state_projection_layer.pth"))
+            
+        if self.opt_llm_lora and hasattr(self.llm_model, "save_pretrained"):
+            try:
+                llm_lora_path = os.path.join(path_prefix, "llm_lora_adapters")
+                self.llm_model.save_pretrained(llm_lora_path)
+                self.tokenizer.save_pretrained(llm_lora_path) # Save tokenizer with adapters for convenience
+                logger.info(f"LLM LoRA adapters and tokenizer saved to {llm_lora_path}")
+            except Exception as e:
+                logger.error(f"LLM LoRA adapter saving failed: {e}")
+        logger.info(f"All models saved with prefix {path_prefix}")
+
+    def load_models(self, path_prefix: str ="shppo_model", load_llm_adapters: bool =True):
+        """Loads all network models and optionally LoRA adapters."""
+        try:
+            self.actor_net.load_state_dict(torch.load(os.path.join(path_prefix, "actor_net.pth"), map_location=self.device))
+            self.critic_net.load_state_dict(torch.load(os.path.join(path_prefix, "critic_net.pth"), map_location=self.device))
+            self.latent_net.load_state_dict(torch.load(os.path.join(path_prefix, "latent_net.pth"), map_location=self.device))
+            self.inference_net.load_state_dict(torch.load(os.path.join(path_prefix, "inference_net.pth"), map_location=self.device))
+            
+            state_proj_path = os.path.join(path_prefix, "state_projection_layer.pth")
+            if not isinstance(self.state_projection_layer, nn.Identity) and os.path.exists(state_proj_path):
+                self.state_projection_layer.load_state_dict(torch.load(state_proj_path, map_location=self.device))
+            logger.info(f"Policy, Value, Latent, and Inference networks loaded from {path_prefix}")
+
+            if load_llm_adapters and self.opt_llm_lora: # Check if LoRA was used during training setup
+                llm_lora_adapter_path = os.path.join(path_prefix, "llm_lora_adapters")
+                if os.path.exists(llm_lora_adapter_path):
+                    # Base model is already part of self.llm_model (PeftModel)
+                    # Re-wrap the base model with loaded adapters.
+                    # Ensure base_model is the original, non-PEFT model.
+                    base_model = self.llm_model.base_model.model if hasattr(self.llm_model, "base_model") else self.llm_model
+                    self.llm_model = PeftModel.from_pretrained(base_model, llm_lora_adapter_path, is_trainable=True) # type: ignore [no-untyped-call]
+                    # If tokenizer was saved with adapters, it can be loaded from the same path
+                    # self.tokenizer = AutoTokenizer.from_pretrained(llm_lora_adapter_path)
+                    logger.info(f"LLM LoRA adapters loaded from {llm_lora_adapter_path}")
+                else:
+                    logger.warning(f"LLM LoRA adapters not found at {llm_lora_adapter_path}. Skipping LoRA adapter loading.")
+        except FileNotFoundError as e:
+            logger.error(f"Failed to load models: {e}. Ensure paths are correct and all model files exist at prefix {path_prefix}.")
+        except Exception as e:
+            logger.error(f"An error occurred during model loading from {path_prefix}: {e}", exc_info=True)
+
+
+if __name__ == "__main__":
+    logging.basicConfig(stream=sys.stdout, level=logging.INFO, format='%(asctime)s - %(levelname)s - %(module)s - %(message)s')
+    os.environ["TOKENIZERS_PARALLELISM"] = "false" # Suppress tokenizer parallelism warning
+    torch.backends.cudnn.benchmark = True # type: ignore [misc] # Enable cuDNN auto-tuner
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Using device: {device}")
+    
+    config = SHPPOConfig()
+    # Example override for quick testing:
+    config.num_marl_agents = 2
+    config.total_timesteps = 2000 # Increased for a bit more training
+    config.num_envs = 2
+    config.num_steps_per_env = 20 # Increased steps per env for more data per update
+    config.ppo_epochs = 2
+    config.num_minibatches = 2 # Example of using minibatches
+    config.__post_init__() # Recalculate dependent configs like minibatch_size_team_steps
+
+    config.dataset_max_problems = config.num_envs * 2 # Ensure enough unique problems if possible
+    config.evaluate_episodes = max(1, config.num_envs) 
+    config.evaluate_interval = 5 # Evaluate more frequently for testing
+    config.wandb_project_name = None # Disable WandB for local test runs unless specified
+    
+    # Use a smaller, easily accessible model for testing if a large one isn't available or needed
+    # config.llm_model_name = "gpt2" 
+    # if config.llm_model_name == "gpt2":
+    #     config.lora_target_modules = ["c_attn"] # LoRA target for gpt2
+    # else: # Default for Qwen
+    #     config.lora_target_modules = ["q_proj", "v_proj", "k_proj", "o_proj"]
+
+
+    try:
+        dataset_loader = CodeContestDataset(
+            split="train", 
+            max_problems=config.dataset_max_problems, 
+            max_cases=config.dataset_max_cases, 
+            cache_dir=None # Or specify a cache directory
+        )
+        all_problem_tasks_for_env = dataset_loader.get_all_tasks()
+        if not all_problem_tasks_for_env: 
+            raise ValueError("No tasks loaded from dataset. Check dataset_max_problems or dataset source.")
+        if len(all_problem_tasks_for_env) < config.num_envs:
+            logger.warning(
+                f"Number of loaded unique tasks ({len(all_problem_tasks_for_env)}) is less than num_envs ({config.num_envs}). "
+                "Problems will be sampled with replacement during environment resets."
+            )
+    except Exception as e: 
+        logger.error(f"Dataset loading failed: {e}", exc_info=True)
+        sys.exit(1)
+    
+    shppo_env_instance = SHPPOCodeEnv(config=config, all_problem_tasks=all_problem_tasks_for_env)
+    trainer = SHPPOTrainer(cfg=config, device=device, env=shppo_env_instance)
+    
+    try:
+        logger.info("Starting SHPPO training...")
+        trainer.train(total_timesteps_override=config.total_timesteps)
+        logger.info("Training finished successfully.")
+        trainer.save_models("shppo_final_model_after_train")
+        logger.info("Final models saved to 'shppo_final_model_after_train'.")
+    except KeyboardInterrupt: 
+        logger.info("Training interrupted by user (KeyboardInterrupt). Saving current models...")
+        trainer.save_models("shppo_model_interrupted")
+        logger.info("Models saved to 'shppo_model_interrupted'.")
+    except Exception as e: 
+        logger.error(f"An unexpected error occurred during training: {e}", exc_info=True)
+        trainer.save_models("shppo_model_error")
+        logger.info("Models saved to 'shppo_model_error' due to error.")
