@@ -1,4 +1,4 @@
-# shppo_trainer.py
+# shppo.py
 import os
 import sys
 import math
@@ -11,7 +11,7 @@ import random
 import numpy as np
 import pandas as pd
 import logging
-import wandb
+import wandb # itertools는 이전 코드 스니펫에 있었으나 현재 코드에서는 직접 사용되지 않으므로 제거했습니다.
 
 from transformers import (
     AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig,
@@ -42,39 +42,36 @@ class MLPBlock(nn.Module):
             current_dim = hidden_dim
         layers_list.append(nn.Linear(current_dim, output_dim))
         self.net = nn.Sequential(*layers_list)
-        self.net.apply(lambda m: ortho_init(m, math.sqrt(2))) # Standard gain for ReLU
+        self.net.apply(lambda m: ortho_init(m, math.sqrt(2)))
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
 class Encoder(nn.Module):
     """
-    Encoder module for the LatentNet.
-    Takes agent's local observation embedding and previous actor RNN hidden state
-    to produce parameters (mu, sigma_raw) for the latent distributions of roles.
-    Corresponds to the Encoder part of LatentNet in SHPPO paper (Fig. 2a).
+    Encoder module for the LatentNet. (Fig. 2a in SHPPO paper).
+    Processes agent's local observation and actor's previous hidden state
+    to output parameters (mu, sigma_raw) for role-specific latent distributions.
     """
     def __init__(self, config: SHPPOConfig):
         super().__init__()
         input_dim = config.obs_embed_dim + config.actor_rnn_hidden_dim
         self.encoder_mlp = MLPBlock(input_dim, config.mlp_hidden_dim, hidden_dim=config.mlp_hidden_dim, num_layers=3)
-        # Output flat tensor for mu and sigma, to be reshaped into (N_ACTION_TEMPLATES, latent_dim)
         self.fc_mu = nn.Linear(config.mlp_hidden_dim, config.N_ACTION_TEMPLATES * config.latent_dim)
         self.fc_sigma = nn.Linear(config.mlp_hidden_dim, config.N_ACTION_TEMPLATES * config.latent_dim)
-        self.fc_mu.apply(lambda m: ortho_init(m, 0.01)) # Small gain for initial mu
-        self.fc_sigma.apply(lambda m: ortho_init(m, 0.01)) # Small gain for initial sigma
+        self.fc_mu.apply(lambda m: ortho_init(m, 0.01))
+        self.fc_sigma.apply(lambda m: ortho_init(m, 0.01))
     
     def forward(self, obs_emb: torch.Tensor, h_actor_prev: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         x = torch.cat([obs_emb, h_actor_prev], dim=-1)
         x = self.encoder_mlp(x)
-        return self.fc_mu(x), self.fc_sigma(x) # Return flat mu_raw, sigma_raw
+        return self.fc_mu(x), self.fc_sigma(x)
 
 class LatentNet(nn.Module):
     """
-    Latent Network (LatentNet) as described in SHPPO paper (Fig. 2a).
-    It uses an Encoder to process observations and memory, then outputs sampled latent variables (z)
-    along with the mean (mu) and standard deviation (sigma) of the learned Gaussian distributions for each role.
-    These latents represent strategy patterns for agents.
+    Latent Network (LatentNet) (Fig. 2a in SHPPO paper).
+    Generates sampled latent variables (z) for roles using an Encoder,
+    along with the mean (mu) and standard deviation (sigma) of the learned distributions.
     """
     def __init__(self, encoder: Encoder, config: SHPPOConfig):
         super().__init__()
@@ -85,51 +82,41 @@ class LatentNet(nn.Module):
     def forward(self, obs_emb: torch.Tensor, h_actor_prev: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         mu_flat, sigma_raw_flat = self.encoder(obs_emb, h_actor_prev)
         
-        # Reshape to (Batch_size, N_ACTION_TEMPLATES, latent_dim)
         mu = mu_flat.view(-1, self.N_ACTION_TEMPLATES, self.latent_dim)
         sigma_raw = sigma_raw_flat.view(-1, self.N_ACTION_TEMPLATES, self.latent_dim)
         
-        # Apply softplus to ensure sigma is positive, add epsilon for numerical stability
-        sigma = F.softplus(sigma_raw) + 1e-5 
+        sigma = F.softplus(sigma_raw) + 1e-5
         
-        # Reparameterization trick: z = mu + sigma * epsilon, where epsilon ~ N(0, I)
-        # This allows gradients to flow back through mu and sigma.
         epsilon = torch.randn_like(sigma)
-        z = mu + sigma * epsilon # Sampled latent variable 'l_i' from paper
+        z = mu + sigma * epsilon
         return z, mu, sigma
 
 class InferenceNet(nn.Module):
     """
-    Inference Network (InferenceNet) as described in SHPPO paper (Fig. 2b).
-    It's a centralized network that takes global state embedding and the parameters (mu, sigma)
-    of latent distributions from all agents for all roles.
-    It predicts an intrinsic value V_I, used to guide the LatentNet learning.
-    Trained via supervised learning against actual returns (Eq. 11).
+    Inference Network (InferenceNet) (Fig. 2b in SHPPO paper).
+    Centralized network taking global state and all agents' latent distribution parameters (mu, sigma)
+    to predict an intrinsic value V_I, guiding LatentNet learning. Trained against actual returns (Eq. 11).
     """
     def __init__(self, config: SHPPOConfig):
         super().__init__()
-        # Input: global_state_emb + flattened_all_mu + flattened_all_sigma
         input_dim = config.global_state_dim_for_inference + \
                       (2 * config.num_marl_agents * config.N_ACTION_TEMPLATES * config.latent_dim)
         self.v_head = MLPBlock(input_dim, 1, hidden_dim=config.mlp_hidden_dim, num_layers=3)
     
     def forward(self, glob_s_emb: torch.Tensor, all_mu_roles_all_agents: torch.Tensor, all_sig_roles_all_agents: torch.Tensor) -> torch.Tensor:
-        # all_mu_roles_all_agents shape: (Batch, Num_MARL_Agents, N_Action_Templates, Latent_Dim)
-        # glob_s_emb shape: (Batch, Global_State_Dim_Inference)
         batch_size = glob_s_emb.shape[0]
         
-        # Flatten mu and sigma tensors for concatenation
         mu_flat = all_mu_roles_all_agents.reshape(batch_size, -1)
         sig_flat = all_sig_roles_all_agents.reshape(batch_size, -1)
         
         x = torch.cat([glob_s_emb, mu_flat, sig_flat], dim=-1)
-        return self.v_head(x).squeeze(-1) # Return V_I
+        return self.v_head(x).squeeze(-1)
 
 class HeteLayerDecoder(nn.Module):
     """
-    Decoder for the Heterogeneous Layer (HeteLayer) as in SHPPO paper (Fig. 2d).
-    It takes a role-specific latent variable 'z_role' (l_i in paper) and decodes it into
-    the weights (W_i) and biases (b_i) for that role's HeteLayer instance in the ActorNet.
+    Decoder for the Heterogeneous Layer (HeteLayer) (Fig. 2d in SHPPO paper).
+    Decodes a role-specific latent variable 'z_role' (l_i in paper) into
+    weights (W_i) and biases (b_i) for that role's HeteLayer in ActorNet.
     """
     def __init__(self, latent_dim: int, hete_input_dim: int, hete_output_dim: int):
         super().__init__()
@@ -138,24 +125,19 @@ class HeteLayerDecoder(nn.Module):
         self.hete_input_dim = hete_input_dim
         self.hete_output_dim = hete_output_dim
         
-        # Initialize decoder weights with smaller scale as they generate other weights
         self.w_decoder.apply(lambda m: ortho_init(m, math.sqrt(0.1))) 
         self.b_decoder.apply(lambda m: ortho_init(m, math.sqrt(0.1)))
     
     def forward(self, z_role: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # z_role shape: (Batch_size * N_ACTION_TEMPLATES, latent_dim)
-        # Weights W need to be (Batch_size*N_ACTION_TEMPLATES, hete_output_dim, hete_input_dim) for bmm
         weights = self.w_decoder(z_role).view(-1, self.hete_output_dim, self.hete_input_dim)
-        biases = self.b_decoder(z_role) # (Batch_size*N_ACTION_TEMPLATES, hete_output_dim)
+        biases = self.b_decoder(z_role)
         return weights, biases
 
 class ActorNet(nn.Module):
     """
-    Actor Network (ActorNet) for each agent, with a Heterogeneous Layer (HeteLayer)
-    as described in SHPPO paper (Fig. 2c).
-    It processes local observation embeddings, uses an RNN for memory, and then
-    applies role-specific HeteLayers (parameters generated by HeteLayerDecoder from latents)
-    to produce action logits for role selection.
+    Actor Network (ActorNet) with a Heterogeneous Layer (HeteLayer) (Fig. 2c in SHPPO paper).
+    Processes local observations, uses an RNN for memory, and applies role-specific HeteLayers
+    (parameters generated by HeteLayerDecoder from latents) to produce action logits for role selection.
     """
     def __init__(self, config: SHPPOConfig):
         super().__init__()
@@ -164,107 +146,82 @@ class ActorNet(nn.Module):
         self.rnn = nn.GRU(config.actor_rnn_hidden_dim, config.actor_rnn_hidden_dim, batch_first=True)
         self.hete_layer_decoder = HeteLayerDecoder(config.latent_dim, config.hete_layer_input_dim, config.hete_layer_output_dim)
         self.final_mlp = MLPBlock(config.hete_layer_output_dim, config.actor_final_mlp_output_dim, hidden_dim=config.mlp_hidden_dim)
-        self.policy_head = nn.Linear(config.actor_final_mlp_output_dim, 1) # Outputs a score for each role
-        self.policy_head.apply(lambda m: ortho_init(m, 0.01)) # Small gain for policy head
+        self.policy_head = nn.Linear(config.actor_final_mlp_output_dim, 1)
+        self.policy_head.apply(lambda m: ortho_init(m, 0.01))
 
     def forward(self, agent_obs_emb: torch.Tensor, agent_h_prev: torch.Tensor, z_all_roles_for_this_agent: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # agent_obs_emb: (Batch_agent, Obs_Embed_Dim)
-        # agent_h_prev: (Batch_agent, Actor_RNN_Hidden_Dim) - Note: GRU expects (1, Batch_agent, Hidden_Dim) for h_0
-        # z_all_roles_for_this_agent: (Batch_agent, N_ACTION_TEMPLATES, Latent_Dim)
-        
         batch_agent_size = agent_obs_emb.size(0)
         num_roles = self.config.N_ACTION_TEMPLATES
 
-        obs_features = self.obs_encoder(agent_obs_emb) # (Batch_agent, Actor_RNN_Hidden_Dim)
+        obs_features = self.obs_encoder(agent_obs_emb)
         
-        # GRU expects input: (Batch, Seq, Feature) and h_0: (Num_Layers*Num_Directions, Batch, Hidden)
         rnn_output, h_next_gru_unsq = self.rnn(obs_features.unsqueeze(1), agent_h_prev.unsqueeze(0))
-        actor_hidden_state = rnn_output.squeeze(1) # (Batch_agent, Actor_RNN_Hidden_Dim)
+        actor_hidden_state = rnn_output.squeeze(1) 
         
-        # Prepare inputs for HeteLayer:
-        # Expand actor_hidden_state to match the number of roles
-        # (Batch_agent, Actor_RNN_Hidden_Dim) -> (Batch_agent, 1, Actor_RNN_Hidden_Dim)
-        #                                      -> (Batch_agent, N_Roles, Actor_RNN_Hidden_Dim)
-        #                                      -> (Batch_agent * N_Roles, Actor_RNN_Hidden_Dim)
         actor_hidden_state_expanded = actor_hidden_state.unsqueeze(1).repeat(1, num_roles, 1)
         
-        # The hete_layer_input_dim should match actor_rnn_hidden_dim if actor_hidden_state is the direct input
-        # If not, ensure actor_hidden_state is projected to hete_layer_input_dim first.
-        # For SHPPO, actor_hidden_state IS the input to HeteLayer (H_i^t in Fig 2c)
         if actor_hidden_state_expanded.shape[-1] != self.config.hete_layer_input_dim:
-            # This would indicate a config mismatch. For now, assume they are equal.
-            # Consider adding a projection layer if they are intended to be different.
             logger.warning(f"Actor RNN hidden dim ({actor_hidden_state_expanded.shape[-1]}) "
-                           f"does not match HeteLayer input dim ({self.config.hete_layer_input_dim}). "
-                           "This might lead to errors or unintended behavior.")
+                           f"does not match HeteLayer input dim ({self.config.hete_layer_input_dim}).")
 
-        actor_hidden_state_flat = actor_hidden_state_expanded.reshape(-1, self.config.hete_layer_input_dim) # Ensure this dim matches HeteLayerDecoder
+        actor_hidden_state_flat = actor_hidden_state_expanded.reshape(-1, self.config.hete_layer_input_dim)
         
-        # Flatten z_all_roles to (Batch_agent * N_Roles, Latent_Dim)
         z_roles_flat = z_all_roles_for_this_agent.reshape(-1, self.config.latent_dim)
         
-        # Generate HeteLayer parameters (weights W, biases b) for each role
         W_roles, b_roles = self.hete_layer_decoder(z_roles_flat)
-        # W_roles: (Batch_agent*N_Roles, Hete_Out_Dim, Hete_In_Dim)
-        # b_roles: (Batch_agent*N_Roles, Hete_Out_Dim)
         
-        # Apply HeteLayer: hete_features = W_roles @ actor_hidden_state_flat + b_roles
-        # actor_hidden_state_flat needs to be (Batch_agent*N_Roles, Hete_In_Dim, 1) for bmm
-        # Result hete_features: (Batch_agent*N_Roles, Hete_Out_Dim, 1) -> squeeze
         hete_features = torch.bmm(W_roles, actor_hidden_state_flat.unsqueeze(-1)).squeeze(-1) + b_roles
-        # hete_features: (Batch_agent*N_Roles, Hete_Out_Dim)
         
-        # Pass through final MLP and policy head
-        final_features = self.final_mlp(hete_features) # (Batch_agent*N_Roles, Actor_Final_MLP_Output_Dim)
-        role_scores_flat = self.policy_head(final_features) # (Batch_agent*N_Roles, 1)
+        final_features = self.final_mlp(hete_features)
+        role_scores_flat = self.policy_head(final_features)
         
-        # Reshape role_scores to (Batch_agent, N_Roles) to represent logits for role selection
         action_logits = role_scores_flat.view(batch_agent_size, num_roles)
         action_probs = F.softmax(action_logits, dim=-1)
         
-        return action_logits, h_next_gru_unsq.squeeze(0), action_probs # Squeeze h_next to match input shape
+        return action_logits, h_next_gru_unsq.squeeze(0), action_probs
 
 class CriticNet(nn.Module):
     """
-    Centralized Critic Network (CriticNet) as in SHPPO paper (Fig. 2b).
-    It processes team global state embeddings using an RNN to estimate the team value V_C.
-    Used for advantage calculation in PPO.
+    Centralized Critic Network (CriticNet) (Fig. 2b in SHPPO paper).
+    Processes team global state embeddings using an RNN to estimate the team value V_C.
     """
     def __init__(self, config: SHPPOConfig):
         super().__init__()
         self.global_state_projector = MLPBlock(config.global_state_dim_for_critic, config.critic_rnn_hidden_dim, hidden_dim=config.mlp_hidden_dim, num_layers=2)
         self.rnn = nn.GRU(config.critic_rnn_hidden_dim, config.critic_rnn_hidden_dim, batch_first=True)
         self.value_head = MLPBlock(config.critic_rnn_hidden_dim, 1, hidden_dim=config.mlp_hidden_dim)
-        self.value_head.apply(lambda m: ortho_init(m, 1.0)) # Standard gain for value head
+        self.value_head.apply(lambda m: ortho_init(m, 1.0))
     
     def forward(self, glob_s_emb: torch.Tensor, h_crit_prev: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # glob_s_emb: (Batch_team, Global_State_Dim_Critic)
-        # h_crit_prev: (Batch_team, Critic_RNN_Hidden_Dim)
-        
-        projected_state = self.global_state_projector(glob_s_emb) # (Batch_team, Critic_RNN_Hidden_Dim)
+        projected_state = self.global_state_projector(glob_s_emb)
         rnn_output, h_crit_next_unsq = self.rnn(projected_state.unsqueeze(1), h_crit_prev.unsqueeze(0))
-        value_prediction = self.value_head(rnn_output.squeeze(1)).squeeze(-1) # (Batch_team)
-        return value_prediction, h_crit_next_unsq.squeeze(0) # Return V_C and next hidden state
+        value_prediction = self.value_head(rnn_output.squeeze(1)).squeeze(-1)
+        return value_prediction, h_crit_next_unsq.squeeze(0)
 
 def build_networks(config: SHPPOConfig, device: torch.device) -> Dict[str, Any]:
-    """Builds and initializes all networks and the tokenizer."""
+    """Builds and initializes all networks, tokenizer, and updates config with dynamic LLM dims."""
     tokenizer = AutoTokenizer.from_pretrained(config.llm_model_name)
     tokenizer.padding_side = "left"
     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
     
-    bnb_cfg = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.bfloat16,  bnb_4bit_use_double_quant=True,
-                                 llm_int8_enable_fp32_cpu_offload=True) # Added from user code
+    bnb_cfg = BitsAndBytesConfig(
+        load_in_4bit=True, 
+        bnb_4bit_quant_type="nf4", 
+        bnb_4bit_compute_dtype=torch.bfloat16, 
+        bnb_4bit_use_double_quant=True,
+        llm_int8_enable_fp32_cpu_offload=True 
+    )
     try: 
         llm_base = AutoModelForCausalLM.from_pretrained(
             config.llm_model_name, 
             quantization_config=bnb_cfg, 
-            device_map={"":device}, # Load model directly to the specified device
+            device_map={"":device},
             torch_dtype=torch.bfloat16, 
             low_cpu_mem_usage=True, 
             trust_remote_code=True
         )
     except Exception as e: 
-        logger.error(f"LLM base model loading failed: {e}. Check model name, network access, and CUDA setup if applicable."); raise
+        logger.error(f"LLM base model loading failed: {e}. Check model name, network access, and CUDA setup."); raise
         
     lora_cfg = LoraConfig(
         r=config.lora_r, 
@@ -278,27 +235,23 @@ def build_networks(config: SHPPOConfig, device: torch.device) -> Dict[str, Any]:
     llm_trainable_params = [p for n,p in llm_peft_model.named_parameters() if "lora_" in n and p.requires_grad]
     
     if not llm_trainable_params: 
-        logger.warning("No LoRA trainable parameters found in LLM. LoRA might not be correctly configured or applied.")
+        logger.warning("No LoRA trainable parameters found in LLM.")
     else: 
-        logger.info(f"LLM LoRA applied to modules: {config.lora_target_modules}. Number of trainable LoRA params: {sum(p.numel() for p in llm_trainable_params)}")
+        logger.info(f"LLM LoRA applied. Trainable LoRA params: {sum(p.numel() for p in llm_trainable_params)}")
         
-    config.llm_actual_hidden_size = llm_base.config.hidden_size # type: ignore [attr-defined]
+    config.llm_actual_hidden_size = llm_base.config.hidden_size 
     
-    # ---- MODIFICATION: Update global state dimensions based on LLM hidden size and scalar features ----
-    # Ensure num_scalar_global_features is defined in config, e.g., in SHPPOConfig or main block.
-    # If it's not always present, provide a default.
-    num_scalar_global_feats = getattr(config, 'num_scalar_global_features', 2) # Defaulting to 2 (pass_fraction, episode_prog)
+    num_scalar_global_feats = getattr(config, 'num_scalar_global_features', 2)
     config.global_state_dim_for_critic = config.llm_actual_hidden_size + num_scalar_global_feats
     config.global_state_dim_for_inference = config.llm_actual_hidden_size + num_scalar_global_feats
     logger.info(f"Set global_state_dim_for_critic: {config.global_state_dim_for_critic}")
     logger.info(f"Set global_state_dim_for_inference: {config.global_state_dim_for_inference}")
-    # ---- END MODIFICATION ----
         
     encoder_module = Encoder(config).to(device)
     latent_net_module = LatentNet(encoder_module, config).to(device)
-    actor_net_module = ActorNet(config).to(device) # Must be after HeteLayer dims are potentially set/checked in config
-    critic_net_module = CriticNet(config).to(device) # Must be after global_state_dim_for_critic is set
-    inference_net_module = InferenceNet(config).to(device) # Must be after global_state_dim_for_inference is set
+    actor_net_module = ActorNet(config).to(device)
+    critic_net_module = CriticNet(config).to(device)
+    inference_net_module = InferenceNet(config).to(device)
     
     params_dict = {
         "llm_lora": llm_trainable_params, 
@@ -320,38 +273,32 @@ def build_networks(config: SHPPOConfig, device: torch.device) -> Dict[str, Any]:
 
 def cosine_diversity(z_roles_batch: torch.Tensor) -> torch.Tensor:
     """
-    Calculates the cosine diversity among roles for a batch of agents.
-    z_roles_batch shape: (Batch_Size_Possibly_Combined * Num_Agents_if_Not_Flattened, Num_Roles, Latent_Dim)
-    This corresponds to L_d in SHPPO paper (Eq. 8). We want to maximize this term.
+    Calculates cosine diversity among roles for a batch (Eq. 8 in SHPPO paper). Maximized.
     """
-    if z_roles_batch.size(1) <= 1: # Cannot compute diversity with 0 or 1 role
+    if z_roles_batch.size(1) <= 1: 
         return torch.tensor(0.0, device=z_roles_batch.device)
     
     batch_diversities = []
-    for i in range(z_roles_batch.size(0)): # Iterate over each item in the batch (e.g., each agent)
-        z_item_roles = z_roles_batch[i] # (Num_Roles, Latent_Dim)
-        if z_item_roles.size(0) <= 1: # If this agent has 0 or 1 role defined (should not happen with N_ACTION_TEMPLATES > 1)
+    for i in range(z_roles_batch.size(0)): 
+        z_item_roles = z_roles_batch[i] 
+        if z_item_roles.size(0) <= 1: 
             batch_diversities.append(torch.tensor(0.0, device=z_item_roles.device))
             continue
         
-        # Normalize latent vectors for cosine similarity calculation
-        z_normalized = F.normalize(z_item_roles, p=2, dim=-1) # (Num_Roles, Latent_Dim)
-        # Cosine similarity matrix: (Num_Roles, Num_Roles)
+        z_normalized = F.normalize(z_item_roles, p=2, dim=-1) 
         similarity_matrix = torch.matmul(z_normalized, z_normalized.transpose(-2, -1))
         
-        # Use upper triangle (excluding diagonal) to get unique pair similarities
         mask = torch.triu(torch.ones_like(similarity_matrix, dtype=torch.bool), diagonal=1)
         
-        if mask.sum() > 0: # If there are pairs to compare
-            # Cosine distance = 1 - cosine similarity
+        if mask.sum() > 0: 
             distances = 1.0 - similarity_matrix[mask]
             batch_diversities.append(distances.mean())
-        else: # No pairs (e.g., only one role)
+        else: 
             batch_diversities.append(torch.tensor(0.0, device=z_item_roles.device))
             
     if not batch_diversities:
         return torch.tensor(0.0, device=z_roles_batch.device)
-    return torch.stack(batch_diversities).mean() # Average diversity across the batch
+    return torch.stack(batch_diversities).mean()
 
 class SHPPOTrainer:
     def __init__(self, cfg: SHPPOConfig, device: torch.device, env: SHPPOCodeEnv):
@@ -360,7 +307,7 @@ class SHPPOTrainer:
         self.env = env
         torch.manual_seed(cfg.seed); random.seed(cfg.seed); np.random.seed(cfg.seed)
         
-        network_components = build_networks(cfg, device) # cfg is updated inside with llm_actual_hidden_size and global_state_dims
+        network_components = build_networks(cfg, device) 
         self.llm_model: PeftModel = network_components["llm_model"]
         self.tokenizer = network_components["tokenizer"]
         self.actor_net: ActorNet = network_components["actor_net"]
@@ -370,7 +317,6 @@ class SHPPOTrainer:
         
         all_params = network_components["params"]
         
-        # Calculate the expected input dimension to the state_projection_layer for local observations
         self.cfg.state_dim_before_projection = (
             self.cfg.llm_actual_hidden_size + 
             self.cfg.obs_simple_plan_embed_dim +
@@ -401,76 +347,68 @@ class SHPPOTrainer:
         else:
             self.opt_llm_lora = None
             
-        # Rollout buffer dimensions
         S, B, Na, Nr, Dl = cfg.num_steps_per_env, cfg.num_envs, cfg.num_marl_agents, cfg.N_ACTION_TEMPLATES, cfg.latent_dim
         Da_loc, Dglob_c, Dglob_i = cfg.obs_embed_dim, cfg.global_state_dim_for_critic, cfg.global_state_dim_for_inference
         Drnn_a, Drnn_c = cfg.actor_rnn_hidden_dim, cfg.critic_rnn_hidden_dim
         
         self.rollout_buffer = {
-            "local_obs_embeddings": torch.zeros((S, B, Na, Da_loc), dtype=torch.float32, device=device), # For each agent
-            "global_state_embeddings_critic": torch.zeros((S, B, Dglob_c), dtype=torch.float32, device=device), # For team
-            "global_state_embeddings_inference": torch.zeros((S, B, Dglob_i), dtype=torch.float32, device=device), # For team
-            "actor_hidden_states": torch.zeros((S, B, Na, Drnn_a), dtype=torch.float32, device=device), # For each agent
-            "critic_hidden_states": torch.zeros((S, B, Drnn_c), dtype=torch.float32, device=device), # For team critic
-            "latents_z_all_roles": torch.zeros((S, B, Na, Nr, Dl), dtype=torch.float32, device=device), # For each agent, all roles
-            "latents_mu_all_roles": torch.zeros((S, B, Na, Nr, Dl), dtype=torch.float32, device=device),# For each agent, all roles
-            "latents_sigma_all_roles": torch.zeros((S, B, Na, Nr, Dl), dtype=torch.float32, device=device),# For each agent, all roles
-            "actions": torch.zeros((S, B, Na), dtype=torch.long, device=device), # Chosen role index for each agent
-            "log_probs": torch.zeros((S, B, Na), dtype=torch.float32, device=device), # Log prob of chosen role for each agent
-            "team_rewards": torch.zeros((S, B), dtype=torch.float32, device=device), # Team reward per team step
-            "team_values": torch.zeros((S, B), dtype=torch.float32, device=device),  # Team value from critic per team step
-            "team_dones": torch.zeros((S, B), dtype=torch.bool, device=device),     # Team done per team step
+            "local_obs_embeddings": torch.zeros((S, B, Na, Da_loc), dtype=torch.float32, device=device),
+            "global_state_embeddings_critic": torch.zeros((S, B, Dglob_c), dtype=torch.float32, device=device),
+            "global_state_embeddings_inference": torch.zeros((S, B, Dglob_i), dtype=torch.float32, device=device),
+            "actor_hidden_states": torch.zeros((S, B, Na, Drnn_a), dtype=torch.float32, device=device),
+            "critic_hidden_states": torch.zeros((S, B, Drnn_c), dtype=torch.float32, device=device),
+            "latents_z_all_roles": torch.zeros((S, B, Na, Nr, Dl), dtype=torch.float32, device=device),
+            "latents_mu_all_roles": torch.zeros((S, B, Na, Nr, Dl), dtype=torch.float32, device=device),
+            "latents_sigma_all_roles": torch.zeros((S, B, Na, Nr, Dl), dtype=torch.float32, device=device),
+            "actions": torch.zeros((S, B, Na), dtype=torch.long, device=device),
+            "log_probs": torch.zeros((S, B, Na), dtype=torch.float32, device=device),
+            "team_rewards": torch.zeros((S, B), dtype=torch.float32, device=device),
+            "team_values": torch.zeros((S, B), dtype=torch.float32, device=device),
+            "team_dones": torch.zeros((S, B), dtype=torch.bool, device=device),
         }
         self.rollout_problem_llm_responses_for_csv: List[Tuple[Optional[Dict[str, Any]], str]] = [(None, "") for _ in range(cfg.num_envs)]
-        logger.info("SHPPOTrainer (MARL Sequential with step_agent_turn) initialized.")
+        logger.info("SHPPOTrainer initialized.")
 
     def _simple_embed(self, text: str, dim: int) -> np.ndarray:
-        """A very basic text embedding method."""
         vec=np.zeros(dim,dtype=np.float32)
         if text and dim>0:
-            processed_text=text[:dim*4] # Limit text length to avoid excessive computation
-            for char_code in [ord(c) for c in processed_text if ord(c) < 256]: # Simple ASCII char processing
+            processed_text=text[:dim*4] 
+            for char_code in [ord(c) for c in processed_text if ord(c) < 256]:
                 vec[char_code % dim] += 1
             norm = np.linalg.norm(vec)
             return vec / norm if norm > 1e-9 else vec
         return vec
 
-    def _get_llm_embedding(self, text: str, max_length: int) -> torch.Tensor:
-        """Generates embedding for a given text using the configured LLM's input embeddings."""
+    def _get_llm_embedding(self, text: str, max_length: int, track_grads: bool = False) -> torch.Tensor:
+        """Generates embedding, optionally tracking gradients for LLM LoRA."""
         if not text: 
             return torch.zeros(self.cfg.llm_actual_hidden_size, device=self.device)
         
         inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=max_length, padding="max_length").to(self.device)
         
-        with torch.no_grad():
-            # Access the base model's embedding layer correctly
-            if hasattr(self.llm_model, "get_input_embeddings"): # For non-PEFT or directly accessible
+        context_manager = torch.enable_grad() if track_grads else torch.no_grad()
+        with context_manager:
+            if hasattr(self.llm_model, "get_input_embeddings"):
                 base_model_for_embeddings = self.llm_model.get_input_embeddings()
             elif hasattr(self.llm_model, "base_model") and \
                  hasattr(self.llm_model.base_model, "model") and \
-                 hasattr(self.llm_model.base_model.model, "get_input_embeddings"): # Standard PeftModel structure
+                 hasattr(self.llm_model.base_model.model, "get_input_embeddings"):
                 base_model_for_embeddings = self.llm_model.base_model.model.get_input_embeddings()
             else:
-                # Attempt a common fallback or raise error if structure is unknown
                 try:
-                    # This might be the case if self.llm_model is already the base model (e.g. if LoRA not used or model unwrapped)
                     base_model_for_embeddings = self.llm_model.get_input_embeddings() 
                 except AttributeError:
-                    raise AttributeError("LLM model does not have a recognizable get_input_embeddings method. "
-                                       "Checked model, model.base_model.model.")
+                    raise AttributeError("LLM model does not have a recognizable get_input_embeddings method.")
 
-            embeddings = base_model_for_embeddings(inputs.input_ids) # (Batch=1, Seq_Len, Hidden_Size)
-            # Expand attention_mask to match embeddings shape for broadcasting
-            attention_mask_expanded = inputs.attention_mask.unsqueeze(-1).expand_as(embeddings).float() # (1, Seq_Len, Hidden_Size)
-            
-            sum_embeddings = torch.sum(embeddings * attention_mask_expanded, dim=1) # (1, Hidden_Size)
-            
-            # Correct mean pooling: sum of valid token embeddings / number of valid tokens
-            # inputs.attention_mask is (Batch=1, Seq_Len)
-            num_valid_tokens = torch.clamp(inputs.attention_mask.sum(dim=1), min=1e-9) # Shape: (Batch=1)
+            embeddings = base_model_for_embeddings(inputs.input_ids)
+            attention_mask_expanded = inputs.attention_mask.unsqueeze(-1).expand_as(embeddings).float()
+            sum_embeddings = torch.sum(embeddings * attention_mask_expanded, dim=1)
+            num_valid_tokens = torch.clamp(inputs.attention_mask.sum(dim=1), min=1e-9)
+            pooled_embedding = (sum_embeddings / num_valid_tokens.unsqueeze(-1)).squeeze(0)
         
-        # Divide sum of embeddings by number of valid tokens (unsqueeze for broadcasting)
-        return (sum_embeddings / num_valid_tokens.unsqueeze(-1)).squeeze(0) # (Hidden_Size)
+        if not track_grads and pooled_embedding.grad_fn is not None: # Ensure detachment if grads were not intended
+            return pooled_embedding.detach()
+        return pooled_embedding
 
     def get_agent_observation_embedding(self, agent_local_state_components: Dict[str, Any]) -> torch.Tensor:
         prompt_text = agent_local_state_components.get("prompt", "")
@@ -480,7 +418,11 @@ class SHPPOTrainer:
         team_error_text = agent_local_state_components.get("team_errors_summary", "")
         my_last_action_str = agent_local_state_components.get("my_last_action_str", self.cfg.ACTION_TEMPLATES[-1])
         
-        prompt_emb = self._get_llm_embedding(prompt_text, self.cfg.max_prompt_length_for_embedding)
+        # Determine if LoRA weights should be trained by this observation's use (typically for actor)
+        track_llm_grads = self.opt_llm_lora is not None and (self.actor_net.training or self.llm_model.training)
+
+        prompt_emb = self._get_llm_embedding(prompt_text, self.cfg.max_prompt_length_for_embedding, track_grads=track_llm_grads)
+        
         code_emb = torch.tensor(self._simple_embed(team_code_text, self.cfg.obs_simple_code_embed_dim), dtype=torch.float32, device=self.device)
         plan_emb = torch.tensor(self._simple_embed(team_plan_text, self.cfg.obs_simple_plan_embed_dim), dtype=torch.float32, device=self.device)
         
@@ -495,18 +437,15 @@ class SHPPOTrainer:
         last_action_idx = self.cfg.ACTION_TEMPLATES.index(my_last_action_str) if my_last_action_str in self.cfg.ACTION_TEMPLATES else self.cfg.N_ACTION_TEMPLATES - 1
         last_action_one_hot = F.one_hot(torch.tensor(last_action_idx, device=self.device, dtype=torch.long), num_classes=self.cfg.N_ACTION_TEMPLATES).float()
             
-        # Concatenate all feature embeddings
         combined_features = torch.cat([prompt_emb, plan_emb, code_emb , error_emb, last_action_one_hot], dim=-1)
         
-        # Project to the final observation embedding dimension
         return self.state_projection_layer(combined_features)
         
     def get_team_global_state_embedding(self, team_global_state_components: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Constructs global state embeddings for Critic and Inference networks using the problem prompt."""
+        """Constructs global state embeddings using the problem prompt, no LLM grads tracked here."""
         prompt_text = team_global_state_components.get("prompt", "") 
-        prompt_emb = self._get_llm_embedding(prompt_text, self.cfg.max_prompt_length_for_global_embedding)
+        prompt_emb = self._get_llm_embedding(prompt_text, self.cfg.max_prompt_length_for_global_embedding, track_grads=False)
 
-        # 2. (Optional) Add other global features like pass_fraction and episode_progress
         pass_fraction = team_global_state_components.get("team_pass_fraction", 0.0)
         episode_prog = team_global_state_components.get("episode_steps", 0)
         normalized_eps = episode_prog / self.cfg.max_team_episode_steps if self.cfg.max_team_episode_steps > 0 else 0.0
@@ -519,14 +458,12 @@ class SHPPOTrainer:
 
         if scalar_features_list:
             scalar_features = torch.tensor(scalar_features_list, dtype=torch.float32, device=self.device)
-             # Ensure the number of features matches num_scalar_global_features
             if scalar_features.shape[0] != self.cfg.num_scalar_global_features:
                 if scalar_features.shape[0] < self.cfg.num_scalar_global_features:
                     padding = torch.zeros(self.cfg.num_scalar_global_features - scalar_features.shape[0], device=self.device)
                     scalar_features = torch.cat([scalar_features, padding], dim=0)
                 else:
                     scalar_features = scalar_features[:self.cfg.num_scalar_global_features]
-
             combined_global_emb = torch.cat([prompt_emb, scalar_features], dim=-1)
         else:
             combined_global_emb = prompt_emb
@@ -654,7 +591,7 @@ class SHPPOTrainer:
         
         responses = self.call_llm_batch([prompt_text_for_llm])
         return responses[0] if responses else f"# LLM call failed for action: {action_template}"
-
+    
     def call_llm_batch(self, prompt_texts: List[str]) -> List[str]:
         """Calls the LLM in batch with a list of prompt texts."""
         if not prompt_texts: return []
@@ -697,26 +634,20 @@ class SHPPOTrainer:
             for i in range(outputs.shape[0])
         ]
         return decoded_responses
-
+    
     def collect_rollouts(self, current_h_actor_teams_in: torch.Tensor, current_h_critic_teams_in: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Collects rollouts from all parallel environments by sequentially stepping through MARL agents.
-        This version is modified to use `env.step_agent_turn`.
-        """
         cfg = self.cfg
         B, Na, Nr, Dl = cfg.num_envs, cfg.num_marl_agents, cfg.N_ACTION_TEMPLATES, cfg.latent_dim
         
-        # Detach hidden states to prevent gradients from flowing across rollout collections
-        h_actor_teams = current_h_actor_teams_in.detach().clone() # (B, Na, Drnn_a)
-        h_critic_teams = current_h_critic_teams_in.detach().clone() # (B, Drnn_c)
+        h_actor_teams = current_h_actor_teams_in.detach().clone()
+        h_critic_teams = current_h_critic_teams_in.detach().clone()
 
         all_envs_current_agent_loc_obs_comp, all_envs_current_team_global_state_comp = self.env.reset_all_envs()
         all_envs_current_agent_loc_obs_comp = [obs for obs in all_envs_current_agent_loc_obs_comp]
 
+        self.rollout_problem_llm_responses_for_csv = [(None, "") for _ in range(B)]
 
-        self.rollout_problem_llm_responses_for_csv = [(None, "") for _ in range(B)] # For CSV logging
-
-        for t_step in range(cfg.num_steps_per_env): # Iterate over team steps
+        for t_step in range(cfg.num_steps_per_env):
             self.rollout_buffer["actor_hidden_states"][t_step] = h_actor_teams.clone()
             self.rollout_buffer["critic_hidden_states"][t_step] = h_critic_teams.clone()
 
@@ -735,16 +666,18 @@ class SHPPOTrainer:
             self.rollout_buffer["global_state_embeddings_critic"][t_step] = stacked_global_s_crit
             self.rollout_buffer["global_state_embeddings_inference"][t_step] = torch.stack(current_step_global_s_inf_list)
 
-            with torch.no_grad():
+            with torch.no_grad(): # Critic is in eval mode during rollouts for value estimation
                 team_values_at_t, h_critic_next_for_buffer = self.critic_net(stacked_global_s_crit, h_critic_teams)
-            self.rollout_buffer["team_values"][t_step] = team_values_at_t.detach()
+            self.rollout_buffer["team_values"][t_step] = team_values_at_t # Already detached if critic_net is under no_grad
 
-            current_t_step_loc_obs_embeddings_list: List[torch.Tensor] = [torch.zeros(Na, cfg.obs_embed_dim, device=self.device) for _ in range(B)]
-            current_t_step_latents_z_list: List[torch.Tensor] = [torch.zeros(Na, Nr, Dl, device=self.device) for _ in range(B)]
+            current_t_step_loc_obs_embeddings_list = [torch.zeros(Na, cfg.obs_embed_dim, device=self.device) for _ in range(B)]
+            current_t_step_latents_z_list = [torch.zeros(Na, Nr, Dl, device=self.device) for _ in range(B)]
+            # ... (initialize other lists for mu, sigma, actions, log_probs)
             current_t_step_latents_mu_list: List[torch.Tensor] = [torch.zeros(Na, Nr, Dl, device=self.device) for _ in range(B)]
             current_t_step_latents_sigma_list: List[torch.Tensor] = [torch.zeros(Na, Nr, Dl, device=self.device) for _ in range(B)]
             current_t_step_actions_list: List[torch.Tensor] = [torch.zeros(Na, dtype=torch.long, device=self.device) for _ in range(B)]
             current_t_step_log_probs_list: List[torch.Tensor] = [torch.zeros(Na, device=self.device) for _ in range(B)]
+
 
             next_team_global_states_for_next_iteration = [None for _ in range(B)] 
 
@@ -753,7 +686,7 @@ class SHPPOTrainer:
                     self.rollout_buffer["team_rewards"][t_step, env_idx] = 0.0
                     self.rollout_buffer["team_dones"][t_step, env_idx] = True
                     if self.rollout_problem_llm_responses_for_csv[env_idx][0] is None:
-                        self.rollout_problem_llm_responses_for_csv[env_idx] = (self.env.env_states[env_idx].get('task_data',{}), "#DoneEarlierInRollout")
+                        self.rollout_problem_llm_responses_for_csv[env_idx] = (self.env.env_states[env_idx].get('task_data',{}), "#DoneEarlier")
                     next_team_global_states_for_next_iteration[env_idx] = all_envs_current_team_global_state_comp[env_idx] 
                     continue
 
@@ -761,17 +694,17 @@ class SHPPOTrainer:
                     current_agent_loc_obs_comp = all_envs_current_agent_loc_obs_comp[env_idx]
                     if current_agent_loc_obs_comp is None : 
                         current_t_step_loc_obs_embeddings_list[env_idx][agent_idx_turn, :] = torch.zeros(cfg.obs_embed_dim, device=self.device)
-                        # ... other placeholders for latents, actions, log_probs if needed for strictness
                         llm_response_str = "#AgentObsNone"
-                        action_template_str = cfg.ACTION_TEMPLATES[-1] # noop
+                        action_template_str = cfg.ACTION_TEMPLATES[-1] 
                     else:
-                        loc_obs_emb = self.get_agent_observation_embedding(current_agent_loc_obs_comp)
+                        # LLM grads not tracked during rollouts for obs embedding
+                        loc_obs_emb = self.get_agent_observation_embedding(current_agent_loc_obs_comp) 
                         current_t_step_loc_obs_embeddings_list[env_idx][agent_idx_turn, :] = loc_obs_emb
                         
                         h_actor_current_agent_for_env = h_actor_teams[env_idx, agent_idx_turn, :].unsqueeze(0) 
                         loc_obs_emb_unsqueezed = loc_obs_emb.unsqueeze(0) 
 
-                        self.actor_net.eval(); self.latent_net.eval() 
+                        # Actor and LatentNet are in eval mode and under no_grad for rollouts
                         with torch.no_grad():
                             z_roles, mu_roles, sig_roles = self.latent_net(loc_obs_emb_unsqueezed, h_actor_current_agent_for_env)
                             logits, h_actor_next_agent_for_env, _ = self.actor_net(loc_obs_emb_unsqueezed, h_actor_current_agent_for_env, z_roles)
@@ -779,7 +712,7 @@ class SHPPOTrainer:
                         dist = torch.distributions.Categorical(logits=logits)
                         action_selected_idx_tensor = dist.sample()
                         action_selected_idx = action_selected_idx_tensor.item()
-                        log_prob_selected = dist.log_prob(action_selected_idx_tensor).item()
+                        log_prob_selected = dist.log_prob(action_selected_idx_tensor).item() # log_prob of sampled action
 
                         current_t_step_latents_z_list[env_idx][agent_idx_turn,:,:] = z_roles.squeeze(0)
                         current_t_step_latents_mu_list[env_idx][agent_idx_turn,:,:] = mu_roles.squeeze(0)
@@ -789,6 +722,8 @@ class SHPPOTrainer:
                         h_actor_teams[env_idx, agent_idx_turn, :] = h_actor_next_agent_for_env.squeeze(0) 
 
                         action_template_str = cfg.ACTION_TEMPLATES[action_selected_idx]
+                        logger.info(f"[Rollout][Env {env_idx}][TeamStep {t_step}][Agent {agent_idx_turn}] Selected Action: {action_template_str} (LogProb: {log_prob_selected:.3f})")
+                        # generate_llm_response_for_action is already under @torch.no_grad()
                         llm_response_str = self.generate_llm_response_for_action(current_agent_loc_obs_comp, action_template_str)
                     
                     next_obs_for_next_agent, team_glob_s_after_agent_turn, team_rew, team_done, is_next_turn, info = \
@@ -803,7 +738,7 @@ class SHPPOTrainer:
                         self.rollout_buffer["team_dones"][t_step, env_idx] = team_done
                         if team_done and self.rollout_problem_llm_responses_for_csv[env_idx][0] is None:
                             task_data_csv = self.env.env_states[env_idx].get('task_data', {})
-                            final_code_csv = self.env.env_states[env_idx].get("team_overall_code", "#TeamStepEndInRollout")
+                            final_code_csv = self.env.env_states[env_idx].get("team_overall_code", "#TeamStepEnd")
                             self.rollout_problem_llm_responses_for_csv[env_idx] = (task_data_csv, final_code_csv)
                         break 
 
@@ -814,13 +749,13 @@ class SHPPOTrainer:
             self.rollout_buffer["actions"][t_step] = torch.stack(current_t_step_actions_list)
             self.rollout_buffer["log_probs"][t_step] = torch.stack(current_t_step_log_probs_list)
             
-            h_critic_teams = h_critic_next_for_buffer.detach() 
+            h_critic_teams = h_critic_next_for_buffer # Already detached if critic_net was in no_grad or from no_grad block
             all_envs_current_team_global_state_comp = next_team_global_states_for_next_iteration
 
         for env_idx_csv_final in range(B): 
             if self.rollout_problem_llm_responses_for_csv[env_idx_csv_final][0] is None: 
                 task_data_csv = self.env.env_states[env_idx_csv_final].get('task_data', {})
-                final_code_csv = self.env.env_states[env_idx_csv_final].get("team_overall_code", "#RolloutEndedWithoutDone")
+                final_code_csv = self.env.env_states[env_idx_csv_final].get("team_overall_code", "#RolloutEndNotDone")
                 self.rollout_problem_llm_responses_for_csv[env_idx_csv_final] = (task_data_csv, final_code_csv)
         
         eval_data_for_csv_final: List[Tuple[Dict[str, Any], str]] = []
@@ -849,7 +784,7 @@ class SHPPOTrainer:
 
 
     def compute_advantages_and_returns(self, last_team_values_for_gae: torch.Tensor):
-        """Computes advantages and returns using GAE for team-level rewards."""
+        """Computes GAE advantages and returns for team-level rewards."""
         team_advantages = torch.zeros_like(self.rollout_buffer["team_rewards"], device=self.device)
         gae_lambda, gamma = self.cfg.gae_lambda, self.cfg.gamma
         last_gae_lam_team = torch.zeros(self.cfg.num_envs, device=self.device)
@@ -867,7 +802,7 @@ class SHPPOTrainer:
                          self.rollout_buffer["team_values"][t]
             
             team_advantages[t] = last_gae_lam_team = delta_team + \
-                                     gamma * gae_lambda * next_non_terminal_team * last_gae_lam_team
+                                   gamma * gae_lambda * next_non_terminal_team * last_gae_lam_team
         
         team_returns = team_advantages + self.rollout_buffer["team_values"]
         
@@ -877,47 +812,52 @@ class SHPPOTrainer:
         return advantages_per_agent, returns_per_agent_actor_target, team_returns
 
     def ppo_update(self, advantages_agent_flat: torch.Tensor, returns_agent_actor_target_flat: torch.Tensor,
-                   local_obs_flat: torch.Tensor, 
+                   local_obs_flat: torch.Tensor,
                    global_states_critic_flat_team: torch.Tensor, global_states_inference_flat_team: torch.Tensor,
                    actor_h_flat: torch.Tensor, critic_h_team_flat: torch.Tensor,
                    actions_agent_flat: torch.Tensor, log_probs_old_agent_flat: torch.Tensor,
-                   team_returns_flat_target_critic_inf: torch.Tensor, team_values_old_flat_for_clip: torch.Tensor ):
-        """Performs PPO updates for Actor, Critic, LatentNet, and InferenceNet."""
+                   team_returns_flat_target_critic_inf: torch.Tensor, team_values_old_flat_for_clip: torch.Tensor):
+        """Performs PPO updates for Actor, Critic, LatentNet, and InferenceNet, referencing SHPPO Algorithm 2."""
         cfg, device = self.cfg, self.device
         num_agent_samples_total = local_obs_flat.shape[0]
         num_team_samples_total = global_states_critic_flat_team.shape[0]
 
-        if cfg.norm_adv: 
+        if cfg.norm_adv:
             advantages_agent_flat = (advantages_agent_flat - advantages_agent_flat.mean()) / (advantages_agent_flat.std() + 1e-9)
-        
+
         agent_data_minibatch_size = num_agent_samples_total // cfg.num_minibatches
         team_data_minibatch_size = num_team_samples_total // cfg.num_minibatches
 
-
         if agent_data_minibatch_size == 0 or team_data_minibatch_size == 0:
-            logger.warning("Minibatch size is 0, skipping PPO update. Check num_minibatches and rollout buffer size.")
+            logger.warning("Minibatch size is 0, skipping PPO update.")
             return
 
         for _ in range(cfg.ppo_epochs):
             perm_agent_indices = torch.randperm(num_agent_samples_total, device=device)
             perm_team_indices = torch.randperm(num_team_samples_total, device=device)
-            
-            # --- Actor and LLM LoRA Update ---
+
+            # --- Actor and LLM LoRA Update (Loop over agent data minibatches) ---
             for start_idx in range(0, num_agent_samples_total, agent_data_minibatch_size):
                 end_idx = min(start_idx + agent_data_minibatch_size, num_agent_samples_total)
                 mb_agent_indices = perm_agent_indices[start_idx:end_idx]
                 if mb_agent_indices.numel() == 0: continue
 
-                obs_mb_loc = local_obs_flat[mb_agent_indices]
-                h_actor_mb = actor_h_flat[mb_agent_indices]
+                # Detach inputs for this minibatch to prevent graph interference
+                obs_mb_loc_actor = local_obs_flat[mb_agent_indices].detach()
+                h_actor_mb_actor = actor_h_flat[mb_agent_indices].detach()
+                
                 actions_mb_agent = actions_agent_flat[mb_agent_indices]
                 old_log_probs_mb_agent = log_probs_old_agent_flat[mb_agent_indices]
                 adv_mb_agent = advantages_agent_flat[mb_agent_indices]
+
+                # For ActorNet, latents z_roles_for_policy are obtained via LatentNet in no_grad mode.
+                # This means ActorNet does not train LatentNet parameters directly through its own loss.
+                with torch.no_grad():
+                    z_roles_for_policy, _, _ = self.latent_net(obs_mb_loc_actor, h_actor_mb_actor)
                 
-                with torch.no_grad(): 
-                    z_roles_for_policy, _, _ = self.latent_net(obs_mb_loc, h_actor_mb)
+                # ActorNet forward pass. If LLM LoRA is trained, obs_mb_loc_actor (via prompt_emb) will carry grads.
+                current_logits, _, _ = self.actor_net(obs_mb_loc_actor, h_actor_mb_actor, z_roles_for_policy)
                 
-                current_logits, _, _ = self.actor_net(obs_mb_loc, h_actor_mb, z_roles_for_policy)
                 current_dist = torch.distributions.Categorical(logits=current_logits)
                 new_log_probs_agent = current_dist.log_prob(actions_mb_agent)
                 entropy_bonus_actor = current_dist.entropy().mean()
@@ -926,20 +866,19 @@ class SHPPOTrainer:
                 surr1 = ratio * adv_mb_agent
                 surr2 = torch.clamp(ratio, 1 - cfg.clip_coef, 1 + cfg.clip_coef) * adv_mb_agent
                 policy_loss_agent = -torch.min(surr1, surr2).mean()
-                
                 actor_loss_total = policy_loss_agent - cfg.ent_coef * entropy_bonus_actor
-                
+
                 self.opt_actor.zero_grad()
                 if self.opt_llm_lora: self.opt_llm_lora.zero_grad()
                 
                 actor_loss_total.backward() 
-                
+
                 actor_params_to_clip = list(self.actor_net.parameters())
                 if not isinstance(self.state_projection_layer, nn.Identity):
                     actor_params_to_clip += list(self.state_projection_layer.parameters())
                 if cfg.max_grad_norm > 0:
                     nn.utils.clip_grad_norm_(actor_params_to_clip, cfg.max_grad_norm)
-                
+
                 if self.opt_llm_lora:
                     llm_lora_grad_params = [p for p in self.llm_model.parameters() if p.requires_grad and p.grad is not None]
                     if llm_lora_grad_params and cfg.max_grad_norm > 0:
@@ -947,83 +886,86 @@ class SHPPOTrainer:
                     self.opt_llm_lora.step()
                 self.opt_actor.step()
 
-            # --- Critic, LatentNet, InferenceNet Updates (Iterate over team minibatches) ---
+            # --- Critic, LatentNet, InferenceNet Updates (Loop over team data minibatches) ---
+            # This loop aligns with Algorithm 2's "Sample a random minibatch..." and subsequent updates.
             for start_idx in range(0, num_team_samples_total, team_data_minibatch_size):
                 end_idx = min(start_idx + team_data_minibatch_size, num_team_samples_total)
                 mb_team_indices = perm_team_indices[start_idx:end_idx]
                 if mb_team_indices.numel() == 0: continue
-                
-                gs_critic_mb = global_states_critic_flat_team[mb_team_indices]
-                h_critic_mb_team = critic_h_team_flat[mb_team_indices]
-                returns_mb_team_target_critic = team_returns_flat_target_critic_inf[mb_team_indices]
-                
-                current_team_values, _ = self.critic_net(gs_critic_mb, h_critic_mb_team)
-                values_pred_squeezed = current_team_values.squeeze() if current_team_values.ndim > 1 else current_team_values
 
-                if cfg.clip_vloss:
-                    values_old_team_mb = team_values_old_flat_for_clip[mb_team_indices]
-                    values_pred_clipped = values_old_team_mb + torch.clamp(
-                        values_pred_squeezed - values_old_team_mb, -cfg.clip_coef, cfg.clip_coef
-                    )
-                    vf_loss_unclipped = F.mse_loss(values_pred_squeezed, returns_mb_team_target_critic)
-                    vf_loss_clipped = F.mse_loss(values_pred_clipped, returns_mb_team_target_critic)
-                    critic_loss = torch.max(vf_loss_unclipped, vf_loss_clipped).mean()
-                else:
-                    critic_loss = F.mse_loss(values_pred_squeezed, returns_mb_team_target_critic).mean()
-                
-                critic_loss_final = critic_loss * cfg.vf_coef
-                
-                self.opt_critic.zero_grad()
-                critic_loss_final.backward()
-                if cfg.max_grad_norm > 0:
-                    nn.utils.clip_grad_norm_(self.critic_net.parameters(), cfg.max_grad_norm)
-                self.opt_critic.step()
+                # Detach inputs for this minibatch
+                gs_critic_mb = global_states_critic_flat_team[mb_team_indices].detach()
+                h_critic_mb_team = critic_h_team_flat[mb_team_indices].detach()
+                returns_mb_team_target = team_returns_flat_target_critic_inf[mb_team_indices]
+                values_old_team_mb_for_clip = team_values_old_flat_for_clip[mb_team_indices]
                 
                 agent_indices_for_lat_inf_list = []
-                for team_idx_val in mb_team_indices.tolist(): 
+                for team_idx_val in mb_team_indices.tolist():
                     for agent_i in range(cfg.num_marl_agents):
                         agent_indices_for_lat_inf_list.append(team_idx_val * cfg.num_marl_agents + agent_i)
                 
                 mb_agent_indices_for_lat_inf = torch.tensor(agent_indices_for_lat_inf_list, device=device, dtype=torch.long)
                 if mb_agent_indices_for_lat_inf.numel() == 0: continue
 
-                obs_mb_loc_for_lat = local_obs_flat[mb_agent_indices_for_lat_inf]
-                h_actor_mb_for_lat = actor_h_flat[mb_agent_indices_for_lat_inf]
-                gs_inference_mb = global_states_inference_flat_team[mb_team_indices] 
-                returns_mb_team_target_inf = team_returns_flat_target_critic_inf[mb_team_indices]
+                obs_mb_loc_for_lat_inf = local_obs_flat[mb_agent_indices_for_lat_inf].detach()
+                h_actor_mb_for_lat_inf = actor_h_flat[mb_agent_indices_for_lat_inf].detach()
+                gs_inference_mb = global_states_inference_flat_team[mb_team_indices].detach()
 
-                z_latents, mu_latents, sigma_latents = self.latent_net(obs_mb_loc_for_lat, h_actor_mb_for_lat)
+                # --- 2) CriticNet Update (Equation 14) ---
+                current_team_values, _ = self.critic_net(gs_critic_mb, h_critic_mb_team)
+                values_pred_squeezed = current_team_values.squeeze() if current_team_values.ndim > 1 else current_team_values
+                if cfg.clip_vloss:
+                    values_pred_clipped = values_old_team_mb_for_clip + torch.clamp(
+                        values_pred_squeezed - values_old_team_mb_for_clip, -cfg.clip_coef, cfg.clip_coef)
+                    vf_loss_unclipped = F.mse_loss(values_pred_squeezed, returns_mb_team_target)
+                    vf_loss_clipped = F.mse_loss(values_pred_clipped, returns_mb_team_target)
+                    critic_loss = torch.max(vf_loss_unclipped, vf_loss_clipped).mean()
+                else:
+                    critic_loss = F.mse_loss(values_pred_squeezed, returns_mb_team_target).mean()
+                critic_loss_final = critic_loss * cfg.vf_coef
                 
-                latent_entropy = (0.5 * cfg.latent_dim * (1 + math.log(2 * math.pi)) + torch.log(sigma_latents + 1e-9).sum(dim=-1)).mean()
+                self.opt_critic.zero_grad()
+                critic_loss_final.backward()
+                if cfg.max_grad_norm > 0: nn.utils.clip_grad_norm_(self.critic_net.parameters(), cfg.max_grad_norm)
+                self.opt_critic.step()
+
+                # --- LatentNet & InferenceNet Updates (Equations 6, 7, 8, 10, 11) ---
+                # LatentNet forward pass (for Eq 7, 8)
+                z_latents, mu_latents, sigma_latents = self.latent_net(obs_mb_loc_for_lat_inf, h_actor_mb_for_lat_inf)
+                latent_entropy = (0.5 * cfg.latent_dim * (1 + math.log(2 * math.pi)) + torch.log(sigma_latents + 1e-9).sum(dim=-1)).mean() # L_e
+                latent_diversity = cosine_diversity(z_latents) # L_d
                 
-                latent_diversity = cosine_diversity(z_latents) 
+                current_team_minibatch_size = mb_team_indices.size(0)
+                mu_latents_team_view = mu_latents.view(current_team_minibatch_size, cfg.num_marl_agents, cfg.N_ACTION_TEMPLATES, cfg.latent_dim)
+                sigma_latents_team_view = sigma_latents.view(current_team_minibatch_size, cfg.num_marl_agents, cfg.N_ACTION_TEMPLATES, cfg.latent_dim)
                 
-                current_minibatch_team_size = mb_team_indices.size(0)
-                mu_latents_team_view = mu_latents.view(current_minibatch_team_size, cfg.num_marl_agents, cfg.N_ACTION_TEMPLATES, cfg.latent_dim)
-                sigma_latents_team_view = sigma_latents.view(current_minibatch_team_size, cfg.num_marl_agents, cfg.N_ACTION_TEMPLATES, cfg.latent_dim)
-                
+                # Compute L_v (Eq 6) for LatentNet loss (Eq 10)
+                # Gradients will flow from V_I_for_latent_loss to mu_latents_team_view & sigma_latents_team_view,
+                # and thus to LatentNet parameters. InferenceNet parameters are also part of this graph.
                 V_I_for_latent_loss = self.inference_net(gs_inference_mb, mu_latents_team_view, sigma_latents_team_view)
                 
-                loss_latent_net = -V_I_for_latent_loss.mean() + \
-                                  cfg.lambda_e_latent * latent_entropy - \
-                                  cfg.lambda_d_latent * latent_diversity
+                loss_L_v = -V_I_for_latent_loss.mean() * cfg.lambda_V_I_guidance_for_latent # This is -L_v term in Eq 10
+                loss_L_e = cfg.lambda_e_latent * latent_entropy
+                loss_L_d = -cfg.lambda_d_latent * latent_diversity
+                loss_latent_net = loss_L_v + loss_L_e + loss_L_d
                 
                 self.opt_latent.zero_grad()
-                loss_latent_net.backward() 
-                if cfg.max_grad_norm > 0: 
-                    nn.utils.clip_grad_norm_(self.latent_net.parameters(), cfg.max_grad_norm)
+                # Important: Grads for InferenceNet might be populated by loss_latent_net.backward()
+                # These are zeroed out before InferenceNet's own update.
+                loss_latent_net.backward(retain_graph=True) # Retain graph for InferenceNet's own update
+                if cfg.max_grad_norm > 0: nn.utils.clip_grad_norm_(self.latent_net.parameters(), cfg.max_grad_norm)
                 self.opt_latent.step() 
 
-                mu_latents_team_view_detached = mu_latents_team_view.detach()
-                sigma_latents_team_view_detached = sigma_latents_team_view.detach()
-                
-                V_I_for_inference_loss = self.inference_net(gs_inference_mb, mu_latents_team_view_detached, sigma_latents_team_view_detached)
-                loss_inference_net = F.mse_loss(V_I_for_inference_loss.squeeze(), returns_mb_team_target_inf) * cfg.lambda_inf_mse
+                # Compute L_I (Eq 11) for InferenceNet update
+                # Use detached latents so InferenceNet loss doesn't backprop to LatentNet parameters
+                V_I_for_inference_loss = self.inference_net(gs_inference_mb, 
+                                                            mu_latents_team_view.detach(), 
+                                                            sigma_latents_team_view.detach())
+                loss_inference_net = F.mse_loss(V_I_for_inference_loss.squeeze(), returns_mb_team_target) * cfg.lambda_inf_mse
                 
                 self.opt_inference.zero_grad() 
-                loss_inference_net.backward()
-                if cfg.max_grad_norm > 0:
-                    nn.utils.clip_grad_norm_(self.inference_net.parameters(), cfg.max_grad_norm)
+                loss_inference_net.backward() 
+                if cfg.max_grad_norm > 0: nn.utils.clip_grad_norm_(self.inference_net.parameters(), cfg.max_grad_norm)
                 self.opt_inference.step()
 
 
@@ -1174,7 +1116,7 @@ class SHPPOTrainer:
                         action_str_eval = cfg.ACTION_TEMPLATES[action_idx_eval]
                         
                         h_actor_eval_env[0, agent_idx_turn_eval, :] = h_actor_next_unsqueeze_eval.squeeze(0).detach()
-                        
+                        logger.info(f"[Evaluate][Task: {problem_task_for_eval.get('name', f'EvalTask{i}')}][Agent {agent_idx_turn_eval}] Selected Action: {action_str_eval}")
                         llm_response_eval = self.generate_llm_response_for_action(
                             agent_local_obs_components=current_agent_loc_obs_comp_eval,
                             action_template=action_str_eval
@@ -1274,10 +1216,10 @@ if __name__ == "__main__":
     
     config = SHPPOConfig()
     # Example override for quick testing:
-    config.num_marl_agents = 2
+    config.num_marl_agents = 3
     config.total_timesteps = 2000 
-    config.num_envs = 2
-    config.num_steps_per_env = 20 
+    config.num_envs = 4
+    config.num_steps_per_env = 2 
     config.ppo_epochs = 2
     config.num_minibatches = 2 
     
