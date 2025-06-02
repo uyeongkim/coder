@@ -6,3 +6,4 @@ supervised_model/
 *.pyc
 generated_samples/
 wandb/
+*.csv

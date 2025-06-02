@@ -3,6 +3,11 @@
 A full PPO training script using Qwen-LoRA as actor and a custom Critic,
 with CodeTester (from test.py) as the environment. Single‐step episodes,
 vectorized across multiple CodeTester instances.
+
+Improvements:
+- Adaptive learning rate with cosine/linear schedule
+- GAE advantage normalization
+- Value loss clipping
 """
 
 import os
@@ -11,6 +16,7 @@ import torch
 from torch.distributions import Categorical
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Tuple
 import random
@@ -34,35 +40,66 @@ from test import CodeContestDataset, CodeTester
 @dataclass
 class PPOConfig:
     # Environment / rollout
-    num_envs: int = 2
-    rollout_length: int = 1      # single‐step episodes
+    num_envs: int = 6
+    rollout_length: int = 1      # FIXED: 단일 action이므로, 1 고정
     gamma: float = 0.99
     lam: float = 0.95
-    updates: int = 10  # Number of PPO updates
+    updates: int = 30  # Number of PPO updates
 
     # PPO update
-    epochs: int = 10
-    clip_eps: float = 0.2
+    epochs: int = 80
+    clip_eps: float = 0.1
     vf_coef: float = 0.5
-    ent_coef: float = 0.01
-    max_grad_norm: float = 0.5
-    batch_size: int = 2         # minibatch size for PPO (<= num_envs * rollout_length)
+    ent_coef: float = 0.005
+    max_grad_norm: float = 0.3
+    batch_size: int = 6         # minibatch size for PPO (<= num_envs * rollout_length)
 
-    # Optimizer
-    learning_rate: float = 3e-4
+    # Adaptive Learning Rate
+    init_lr: float = 1e-4       # Initial learning rate
+    final_lr: float = 5e-6      # Final learning rate for decay
+    lr_schedule: str = "linear" # "cosine", "linear", "constant"
+    warmup_updates: int = 8     # Number of warmup updates
+
+    # Advanced PPO Features
+    use_gae_normalization: bool = True  # Normalize GAE advantages
+    value_loss_clipping: bool = True    # Clip value loss
+    value_clip_range: float = 0.1       # Value clipping range
 
     # Training
-    max_problems_per_update: int = 10  # Number of problems to sample per update
-    sample_space: int = 4 # Action space size (number of test cases per problem)
+    max_problems_per_update: int = 6    # Number of problems to sample per update
+    sample_space: int = 4               # Action space size (number of test cases per problem)
     
     # Model Configuration
     lora_r: int = 8
     lora_alpha: int = 16
+    
+    version: str = "v2.0"      # Version for logging
 
     def __post_init__(self):
         assert self.num_envs * self.rollout_length >= self.batch_size, \
             "Batch size must be less than or equal to num_envs * rollout_length, " \
             f"got {self.batch_size} > {self.num_envs * self.rollout_length}"
+            
+    def get_learning_rate(self, current_update: int) -> float:
+        """Compute learning rate based on current update with warmup and decay"""
+        if current_update < self.warmup_updates:
+            # Linear warmup
+            return self.init_lr * (current_update / self.warmup_updates)
+        
+        # Progress after warmup
+        progress = (current_update - self.warmup_updates) / (self.updates - self.warmup_updates)
+        progress = min(1.0, max(0.0, progress))
+        
+        if self.lr_schedule == "cosine":
+            # Cosine annealing
+            return self.final_lr + 0.5 * (self.init_lr - self.final_lr) * (1 + math.cos(math.pi * progress))
+        elif self.lr_schedule == "linear":
+            # Linear decay
+            return self.init_lr - progress * (self.init_lr - self.final_lr)
+        elif self.lr_schedule == "constant":
+            return self.init_lr
+        else:
+            raise ValueError(f"Unknown learning rate schedule: {self.lr_schedule}")
 
 # -----------------------------------------------------------------------------
 # Critic Network
@@ -106,8 +143,9 @@ def build_actor_and_critic(cfg: PPOConfig, device: torch.device) -> tuple:
         device_map="auto",
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
-        trust_remote_code=True,
+        trust_remote_code=True,   
     )
+    actor_base.config.use_sliding_window_attention = False
     actor_base.eval()
 
     # 3) LoRA injection
@@ -140,29 +178,53 @@ def build_actor_and_critic(cfg: PPOConfig, device: torch.device) -> tuple:
 # PPO Trainer with CodeTester Integration
 # -----------------------------------------------------------------------------
 class PPOTrainer:
-    def __init__(self, cfg: PPOConfig, device: torch.device):
+    def __init__(self, cfg: PPOConfig, device: torch.device, log_file: str = None):
+        
         self.cfg = cfg
         self.device = device
+        self.log_file = log_file
 
         # Build actor, critic, tokenizer
         self.actor, self.critic, a_vars, c_vars, self.tokenizer = build_actor_and_critic(cfg, device)
+        
+        # Initialize optimizer with initial learning rate
         self.optimizer = optim.AdamW(
             a_vars + c_vars,
-            lr=cfg.learning_rate,
+            lr=cfg.init_lr,
             betas=(0.9, 0.999),
             eps=1e-8,
             weight_decay=0.01,
         )
 
-        # Dataset and CodeTester
-        self.dataset = CodeContestDataset(split="train", max_problems=100, max_cases=3)
+        # Datasets and CodeTesters for train, validation, and test splits
+        self.dataset = CodeContestDataset(split="train", max_cases=3)
+        self.eval_dataset = CodeContestDataset(split="valid")
+        self.test_dataset = CodeContestDataset(split="test")
+
         self.code_tester = CodeTester(
-            dataset=self.dataset, 
-            batch_size=cfg.num_envs, 
+            dataset=self.dataset,
+            batch_size=100,
+            max_workers=4
+        )
+        self.eval_tester = CodeTester(
+            dataset=self.eval_dataset,
+            batch_size=100,
+            max_workers=4
+        )
+        self.test_tester = CodeTester(
+            dataset=self.test_dataset,
+            batch_size=100,
             max_workers=4
         )
         
         print(f"Loaded {len(self.dataset.get_all_tasks())} tasks for training")
+
+    def update_learning_rate(self, current_update: int):
+        """Update learning rate based on schedule"""
+        new_lr = self.cfg.get_learning_rate(current_update)
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = new_lr
+        return new_lr
 
     def sample_problems(self, num_problems: int) -> List[Dict[str, Any]]:
         """Sample random problems from the dataset"""
@@ -171,7 +233,7 @@ class PPOTrainer:
 
     def evaluate_solutions_with_tester(self) -> List[float]:
         """Evaluate solutions using the test cases, aggregate rewards per problem, and return per-problem rewards"""
-        csv_file = "execution_results.csv"
+        csv_file = self.log_file
         results = pd.read_csv(csv_file)
         os.remove(csv_file)  # Clean up after evaluation
         rewards = []
@@ -189,25 +251,6 @@ class PPOTrainer:
             avg_reward = sum(case_rewards) / len(case_rewards) if case_rewards else 0.0
             rewards.append(avg_reward)
         return rewards
-    
-    def extract_solve_function(self, response: str) -> callable:
-        """Extract solve function from model response"""
-        import re
-        
-        code_pattern = re.compile(r'```python(.*?)```', re.DOTALL)
-        code_match = code_pattern.search(response)
-        code_str = code_match.group(1).strip() if code_match else response.strip()
-        
-        # Quick validation before exec
-        if not code_str or 'def solve' not in code_str:
-            return None
-            
-        namespace = {}
-        try:
-            exec(code_str, namespace)
-            return namespace.get("solve", None)
-        except Exception:
-            return None
 
     def collect_rollouts(self) -> Dict[str, torch.Tensor]:
         """Collect rollouts by sampling problems and generating solutions"""
@@ -221,21 +264,19 @@ class PPOTrainer:
         # Create a temporary CodeTester with the sampled problems
         temp_tester = CodeTester(
             dataset=temp_dataset,
-            batch_size=self.cfg.num_envs,
-            max_workers=4
+            batch_size=self.cfg.num_envs * self.cfg.sample_space,
+            max_workers=4,
+            log_file=self.log_file
         )
 
-        # Generate solutions with hidden states and log probabilities
-        # Use ask_qwen_batch_optimized instead of run()
-        result = temp_tester.ask_qwen_batch_optimized(
-            tokenizer=self.tokenizer,
-            model=self.actor,
-            prompts=[problem['prompt'] for problem in problems],
+        # Use tester.run to generate and write CSV, also get responses & hidden/logprobs
+        avg_rate, solutions, hidden_states, generated_tokens, log_probs = temp_tester.run(
+            self.tokenizer,
+            self.actor,
             return_hidden=True,
             return_logprobs=True,
-            num_return_sequences=self.cfg.sample_space,
+            num_return_seqs=self.cfg.sample_space
         )
-        solutions, hidden_states, generated_tokens, log_probs = result
 
         # Sample one candidate per prompt using the policy over candidates
         batch_size = self.cfg.num_envs
@@ -248,6 +289,8 @@ class PPOTrainer:
         # Reshape tokens and log_probs into [batch_size, num_return_sequences, ...]
         tokens = generated_tokens.view(batch_size, num_return_sequences, -1)
         probs = log_probs.view(batch_size, num_return_sequences)
+        # Sanitize log_probs to avoid NaN or -inf logits in Categorical
+        probs = torch.nan_to_num(probs, nan=-1e4, neginf=-1e4)
         # Build categorical distribution and sample
         dist = Categorical(logits=probs)           # shape: [batch_size, num_return_sequences]
         chosen_indices = dist.sample()              # shape: [batch_size]
@@ -261,10 +304,11 @@ class PPOTrainer:
             for i in range(batch_size)
         ], dim=0)
         # Use sampled log-prob for PPO update
-        log_probs = dist.log_prob(chosen_indices).to(self.device)  # shape: [batch_size]
+        log_probs = dist.log_prob(chosen_indices).to(self.device)
+        # hidden_states shape: (batch_size, hidden_dim); no reshaping needed
 
         # Evaluate solutions to get rewards
-        rewards = self.code_tester.evaluate_solutions_with_tester()
+        rewards = self.evaluate_solutions_with_tester()
 
         # Convert to tensors and move to device
         rewards_tensor = torch.tensor(rewards, dtype=torch.float32, device=self.device)
@@ -285,31 +329,30 @@ class PPOTrainer:
         }
 
     def compute_advantages(self, rewards: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
-        """Compute advantages using Generalized Advantage Estimation (GAE)"""
+        """Compute advantages using Generalized Advantage Estimation (GAE) with optional normalization"""
         advantages = torch.zeros_like(rewards)
         gae = 0.0
         for t in reversed(range(len(rewards))):
             delta = rewards[t] - values[t]
             gae = delta + self.cfg.gamma * self.cfg.lam * gae
             advantages[t] = gae
+        
+        # GAE Normalization (improved stability)
+        if self.cfg.use_gae_normalization and advantages.std() > 1e-8:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        
         return advantages
 
     def ppo_update(self, batch: Dict[str, torch.Tensor]):
-        """Perform PPO update with proper policy loss computation"""
+        """Perform PPO update with improved value loss and advantage computation"""
         rewards = batch["rewards"]
-        values = batch["values"]
+        old_values = batch["values"]
         hidden_states = batch["hidden_states"]
         old_log_probs = batch["log_probs"]
         
-        # Compute advantages
-        advantages = self.compute_advantages(rewards, values)
-        
-        # Normalize advantages
-        if advantages.std() > 1e-8:
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        
-        # Value targets
-        returns = rewards  # For single-step episodes
+        # Compute advantages and returns
+        advantages = self.compute_advantages(rewards, old_values)
+        returns = rewards  # For single-step episodes, returns = rewards
         
         # Multiple PPO epochs
         total_policy_loss = 0.0
@@ -320,18 +363,47 @@ class PPOTrainer:
             # Get current value estimates
             current_values = self.critic(hidden_states)
             
-            # Value loss
-            value_loss = nn.MSELoss()(current_values, returns)
+            # Value loss with optional clipping
+            if self.cfg.value_loss_clipping:
+                # Clipped value loss (similar to policy clipping)
+                value_pred_clipped = old_values + torch.clamp(
+                    current_values - old_values, 
+                    -self.cfg.value_clip_range, 
+                    self.cfg.value_clip_range
+                )
+                value_losses = (current_values - returns) ** 2
+                value_losses_clipped = (value_pred_clipped - returns) ** 2
+                value_loss = 0.5 * torch.max(value_losses, value_losses_clipped).mean()
+            else:
+                value_loss = nn.MSELoss()(current_values, returns)
             
             # PPO policy loss with clipping
-            # Placeholder for recomputing new log_probs
-            # (for now, assume we stored them in old_log_probs and don't change actor outputs)
-            ratios = torch.exp(old_log_probs - old_log_probs.detach())
+            # Recompute log_probs under current policy for the chosen solutions
+            input_encodings = self.tokenizer(batch["solutions"], return_tensors="pt", padding=True, truncation=True).to(self.device)
+            outputs = self.actor(**input_encodings, return_dict=True)
+            logits = outputs.logits  # (batch, seq_len, vocab_size)
+
+            # Prepare next-token labels
+            labels = input_encodings.input_ids
+            shift_logits = logits[:, :-1, :].contiguous()      # (batch, seq_len-1, vocab_size)
+            shift_labels = labels[:, 1:].contiguous()           # (batch, seq_len-1)
+
+            # Compute per-token log-probs
+            log_probs_flat = F.log_softmax(shift_logits, dim=-1)       # (batch, seq_len-1, vocab_size)
+            token_log_probs = log_probs_flat.gather(-1, shift_labels.unsqueeze(-1)).squeeze(-1)  # (batch, seq_len-1)
+
+            # Sum per-token log-probs to get sequence log_prob
+            new_log_probs = token_log_probs.sum(dim=1)  # (batch,)
+
+            # Compute ratio between new and old log_probs
+            ratios = (new_log_probs - old_log_probs).exp()
             clipped_ratios = torch.clamp(ratios, 1.0 - self.cfg.clip_eps, 1.0 + self.cfg.clip_eps)
             policy_loss = -torch.min(ratios * advantages, clipped_ratios * advantages).mean()
             
-            # Simple entropy bonus (using log_probs as proxy)
-            entropy_loss = -old_log_probs.mean() * self.cfg.ent_coef
+            # Enhanced entropy calculation (using actual token probabilities)
+            token_probs = F.softmax(shift_logits, dim=-1)
+            entropy = -(token_probs * F.log_softmax(shift_logits, dim=-1)).sum(dim=-1).mean()
+            entropy_loss = -entropy * self.cfg.ent_coef
             
             # Total loss
             loss = policy_loss + self.cfg.vf_coef * value_loss - entropy_loss
@@ -359,7 +431,7 @@ class PPOTrainer:
         wandb.init(
             project="PPO-CodeTester",
             config=self.cfg,
-            name=f"PPO-Training-{updates}Updates",
+            name=f"PPO-Training-{self.cfg.version}-{updates}Updates",
             reinit=True
         )
         wandb.config.update(
@@ -373,19 +445,29 @@ class PPOTrainer:
         )
         
         """Main training loop"""
-        print("Starting PPO training...")
+        print("Starting PPO training with improvements...")
+        print(f"- Adaptive learning rate: {self.cfg.lr_schedule}")
+        print(f"- GAE normalization: {self.cfg.use_gae_normalization}")
+        print(f"- Value loss clipping: {self.cfg.value_loss_clipping}")
         
         best_avg_reward = 0.0
+        best_val_pass_rate = 0.0
         
         for update in range(1, updates + 1):
+            # Update learning rate
+            current_lr = self.update_learning_rate(update - 1)  # 0-indexed for update
+            
             # Collect rollouts
             batch = self.collect_rollouts()
-            generation_table.add_data(
-                update,
-                batch["prompts"],
-                batch["solutions"],
-                batch["rewards"].cpu().numpy()
-            )
+            
+            # Log to wandb
+            for i in range(len(batch["prompts"])):
+                generation_table.add_row(
+                    update,
+                    str(batch["prompts"][i])[:200] + "..." if len(str(batch["prompts"][i])) > 200 else str(batch["prompts"][i]),
+                    str(batch["solutions"][i])[:300] + "..." if len(str(batch["solutions"][i])) > 300 else str(batch["solutions"][i]),
+                    batch["rewards"][i].item()
+                )
             
             # PPO update
             policy_loss, value_loss, entropy_loss = self.ppo_update(batch)
@@ -404,6 +486,7 @@ class PPOTrainer:
             # Logging
             if update % 5 == 0:
                 print(f"[Update {update:04d}] "
+                      f"lr={current_lr:.2e}, "
                       f"avg_reward={avg_reward:.4f}, "
                       f"max_reward={max_reward:.4f}, "
                       f"min_reward={min_reward:.4f}, "
@@ -411,36 +494,78 @@ class PPOTrainer:
                       f"value_loss={value_loss:.4f}, "
                       f"entropy_loss={entropy_loss:.4f}, "
                       f"avg_log_prob={avg_log_prob:.4f}")
+            
+            # Validation evaluation every 5 updates
+            if update % 5 == 0:
+                print(f"\n--- Validation Evaluation at Update {update} ---")
+                try:
+                    val_pass_rate = self.eval_tester.run(self.tokenizer, self.actor)
+                    print(f"Validation pass rate: {val_pass_rate:.2f}%")
+                    
+                    # Track best validation pass rate
+                    if val_pass_rate > best_val_pass_rate:
+                        best_val_pass_rate = val_pass_rate
+                        print(f"New best validation pass rate: {best_val_pass_rate:.2f}%")
+                        
+                except Exception as e:
+                    print(f"Validation evaluation failed: {e}")
+                    val_pass_rate = 0.0
+                    
+                print("--- End Validation Evaluation ---\n")
+            else:
+                val_pass_rate = 0.0  # No validation this update
+            
+            # Log metrics to Wandb
             wandb.log({
                 "update": update,
-                "avg_reward": avg_reward,
-                "max_reward": max_reward,
-                "min_reward": min_reward,
-                "policy_loss": policy_loss,
-                "value_loss": value_loss,
-                "entropy_loss": entropy_loss,
-                "avg_log_prob": avg_log_prob
+                "train/learning_rate": current_lr,
+                "train/avg_reward": avg_reward,
+                "train/max_reward": max_reward,
+                "train/min_reward": min_reward,
+                "train/policy_loss": policy_loss,
+                "train/value_loss": value_loss,
+                "train/entropy_loss": entropy_loss,
+                "train/avg_log_prob": avg_log_prob,
+                "val/pass_rate": val_pass_rate if val_pass_rate > 0 else None,
+                "val/best_pass_rate": best_val_pass_rate
             }, step=update)
             
-            # Periodic full evaluation
-            if update % 25 == 0:
-                print(f"\n--- Full Evaluation at Update {update} ---")
-                self.full_evaluation()
-                print("--- End Evaluation ---\n")
-            
             wandb.log({"generation": generation_table})
-        print(f"Training complete. Best average reward: {best_avg_reward:.4f}")
+        
+        # Final test split evaluation
+        print("\n--- Final Test Evaluation ---")
+        try:
+            test_pass_rate = self.test_tester.run(self.tokenizer, self.actor)
+            print(f"Test pass rate: {test_pass_rate:.2f}%")
+            
+            # Log final test pass rate
+            wandb.log({
+                "test/pass_rate": test_pass_rate
+            })
+        except Exception as e:
+            print(f"Final test evaluation failed: {e}")
+            test_pass_rate = 0.0
+        
+        print(f"Training complete!")
+        print(f"Best average reward: {best_avg_reward:.4f}")
+        print(f"Best validation pass rate: {best_val_pass_rate:.2f}%")
+        print(f"Final test pass rate: {test_pass_rate:.2f}%")
 
     def full_evaluation(self):
-        """Run a full evaluation using CodeTester.run()"""
-        print("Running full evaluation...")
-        
-        # Use the original CodeTester.run method for comprehensive evaluation
+        """Run a full evaluation using CodeTester.run() on validation and test splits"""
+        print("Running full evaluation on validation split...")
         try:
-            avg_pass_rate = self.code_tester.run(self.tokenizer, self.actor)
-            print(f"Full evaluation pass rate: {avg_pass_rate:.2f}%")
+            val_rate = self.eval_tester.run(self.tokenizer, self.actor)
+            print(f"Validation pass rate: {val_rate:.2f}%")
         except Exception as e:
-            print(f"Full evaluation failed: {e}")
+            print(f"Validation evaluation failed: {e}")
+
+        print("Running full evaluation on test split...")
+        try:
+            test_rate = self.test_tester.run(self.tokenizer, self.actor)
+            print(f"Test pass rate: {test_rate:.2f}%")
+        except Exception as e:
+            print(f"Test evaluation failed: {e}")
 
 
 # -----------------------------------------------------------------------------
@@ -448,7 +573,10 @@ class PPOTrainer:
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    os.remove("execution_results.csv") if os.path.exists("execution_results.csv") else None
+    cur_time = pd.Timestamp.now().strftime("%Y%m%d-%H%M%S")
+    exec_log_file = f"execution_log_{cur_time}.csv"
+    os.environ["EXECUTION_LOG_FILE"] = exec_log_file
+    os.remove(exec_log_file) if os.path.exists(exec_log_file) else None
     
     # Enable optimizations
     torch.backends.cudnn.benchmark = True
@@ -458,5 +586,12 @@ if __name__ == "__main__":
     print(f"Using device: {device}")
     
     cfg = PPOConfig()
-    trainer = PPOTrainer(cfg, device)
+    print(f"PPO Configuration:")
+    print(f"  - Learning rate schedule: {cfg.lr_schedule} ({cfg.init_lr} → {cfg.final_lr})")
+    print(f"  - GAE normalization: {cfg.use_gae_normalization}")
+    print(f"  - Value loss clipping: {cfg.value_loss_clipping}")
+    print(f"  - Updates: {cfg.updates}, Epochs per update: {cfg.epochs}")
+    print(f"  - Num envs: {cfg.num_envs}, Batch size: {cfg.batch_size}")
+    
+    trainer = PPOTrainer(cfg, device, log_file=exec_log_file)
     trainer.train(updates=cfg.updates)
