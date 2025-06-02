@@ -57,29 +57,33 @@ def extract_code_from_response(response: str, code_pattern: Optional[re.Pattern]
     if code_pattern is None: code_pattern = re.compile(r'```python\s*([\s\S]*?)\s*```', re.IGNORECASE)
     match = code_pattern.search(response)
     if match: return match.group(1).strip()
-    if 'def solve' in response:
+    if 'def solve' in response: # Fallback for non-markdown code blocks
         lines = response.split('\n'); code_lines: List[str] = []
         in_solve_block: bool = False; indent_level: int = -1
         for ln, line_content in enumerate(lines):
             sl = line_content.lstrip(); ci = len(line_content) - len(sl)
             if 'def solve' in sl and not in_solve_block: in_solve_block, indent_level = True, ci
             if in_solve_block:
-                if ci < indent_level and sl and ln > 0:
-                    if ln + 1 < len(lines):
+                if ci < indent_level and sl and ln > 0: # Exiting the initial 'def solve' block
+                    if ln + 1 < len(lines): # Check if next line is part of a new deeper block or truly outdented
                         if not lines[ln+1].lstrip() or (len(lines[ln+1]) - len(lines[ln+1].lstrip()) < indent_level): break
-                    else: break
+                    else: break # End of lines
                 code_lines.append(line_content)
         if code_lines: return "\n".join(code_lines).strip()
-    return response
+    return response # Return original if no clear block found
 
 def extract_executable_solve_function(code_str: str) -> Optional[Callable]:
     if not code_str or 'def solve' not in code_str: return None
     namespace: Dict[str, Any] = {}
-    try: exec(code_str, namespace); return namespace.get("solve")
-    except Exception as e: logger.debug(f"Code exec error for solve fn: {e}\nCode: {code_str[:200]}"); return None
+    try: 
+        exec(code_str, namespace)
+        return namespace.get("solve")
+    except Exception as e: 
+        logger.debug(f"Code exec error for solve fn: {e}\nCode: {code_str[:200]}")
+        return None
 
 def _execute_solve_fn_with_timeout(solve_fn: Callable, inp: Any, timeout_seconds: float) -> Any:
-    if timeout_seconds <= 0: return solve_fn(inp)
+    if timeout_seconds <= 0: return solve_fn(inp) # No timeout
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(solve_fn, inp)
         try: return future.result(timeout=timeout_seconds)
@@ -142,8 +146,6 @@ class SHPPOCodeEnv:
     def _get_current_marl_agent_local_obs_components(self, env_idx: int) -> Dict[str, Any]:
         """
         Gets local observation components for the MARL agent whose turn it is in the specified environment.
-        The observation depends on what previous agents in the sequence have done in THIS team step
-        and the overall team state from PREVIOUS team steps.
         """
         env_s = self.env_states[env_idx]
         marl_agent_idx = env_s["current_marl_agent_turn"]
@@ -153,10 +155,10 @@ class SHPPOCodeEnv:
             "team_plan": env_s.get("team_plan", ""),
             "team_errors_summary": env_s.get("team_errors_summary", ""),
             "team_pass_fraction": env_s.get("team_current_pass_fraction", 0.0),
-            "my_id": marl_agent_idx, # Agent's ID within the team (0 to num_marl_agents-1)
-            "task_data": env_s.get("task_data", {}), # Contains problem name, original prompt, tests
-            "episode_step": env_s.get("episode_steps", 0), # Current team step in the episode
-            "my_turn_in_team_step": marl_agent_idx, # Explicitly stating agent's turn order
+            "my_id": marl_agent_idx, # Agent's ID within the team
+            "task_data": env_s.get("task_data", {}), # Original problem data
+            "episode_step": env_s.get("episode_steps", 0), # Current team step
+            "my_turn_in_team_step": marl_agent_idx, # Agent's turn order in sequence
             "my_last_action_str": env_s["marl_agents_last_actions_str"][marl_agent_idx]
         }
     
@@ -164,6 +166,7 @@ class SHPPOCodeEnv:
         """Gets global state components for the team in the specified environment."""
         env_s = self.env_states[env_idx]
         return {
+            "prompt": env_s.get("current_prompt", ""), # Current problem prompt
             "team_pass_fraction": env_s.get("team_current_pass_fraction", 0.0),
             "team_errors_summary": env_s.get("team_errors_summary", ""),
             "episode_steps": env_s.get("episode_steps", 0),
@@ -174,10 +177,7 @@ class SHPPOCodeEnv:
     def reset_all_envs(self) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """ 
         Resets all parallel environments.
-        Returns:
-            Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-            - A list of initial local observation components, one for the *first* MARL agent (turn 0) in each environment.
-            - A list of initial global state components, one for each environment.
+        Returns lists of initial local observation (for first agent) and global state components.
         """
         all_envs_initial_first_agent_loc_obs_comps: List[Dict[str,Any]] = []
         all_envs_initial_global_state_comps: List[Dict[str,Any]] = []
@@ -185,7 +185,7 @@ class SHPPOCodeEnv:
         if num_available_tasks == 0: raise ValueError("No tasks available for reset.")
         
         sampled_indices = []
-        if num_available_tasks < self.num_envs:
+        if num_available_tasks < self.num_envs: # Sample with replacement if not enough unique tasks
             sampled_indices = np.random.choice(num_available_tasks, self.num_envs, replace=True).tolist()
         else:
             sampled_indices = random.sample(range(num_available_tasks), self.num_envs)
@@ -203,7 +203,7 @@ class SHPPOCodeEnv:
         self.env_states[env_idx].update({
             "task_data": problem_task, 
             "current_prompt": problem_task['prompt'],
-            "current_marl_agent_turn": 0 # Ensure turn starts at 0
+            "current_marl_agent_turn": 0 
         })
         first_agent_loc_obs_comps = self._get_current_marl_agent_local_obs_components(env_idx)
         global_state_comps = self._get_team_global_state_components(env_idx)
@@ -256,7 +256,7 @@ class SHPPOCodeEnv:
         error_summary = ""
         if not solved:
             if error_messages:
-                error_summary = "; ".join(error_messages[:2]) 
+                error_summary = "; ".join(error_messages[:2]) # Show first two errors
             elif pass_fraction < 1.0 and not error_messages and len(tests_public) > 0 :
                 error_summary = f"{passed_count}/{len(tests_public)} tests passed but some failed without explicit error messages."
             elif len(tests_public) == 0:
@@ -270,34 +270,6 @@ class SHPPOCodeEnv:
                  ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], float, bool, bool, Dict]:
         """
         Processes an action for the MARL agent whose turn it currently is in the specified environment.
-        Updates the environment state based on this single agent's action and advances the turn.
-        If the agent is the last in the sequence for the current team step, the team's overall code is evaluated,
-        and rewards/done status for the team step are determined.
-
-        Args:
-            env_idx: Index of the parallel environment.
-            marl_agent_action_str: The action template string chosen by the current MARL agent.
-            marl_agent_llm_response: The LLM response generated based on the chosen action.
-
-        Returns:
-            A tuple containing:
-            - next_agent_loc_obs_comps_or_None (Optional[Dict[str, Any]]): 
-                Local observation components for the *next* agent to act. 
-                If the team step just ended, this is for the *first* agent of the *next* team step.
-                None if the episode is done.
-            - current_team_global_state_comps_or_None (Optional[Dict[str, Any]]): 
-                Global state components for the team. This is typically relevant after a full team step,
-                or can represent the evolving global state. None if episode is done.
-            - team_reward (float): 
-                The reward for the team. Non-zero only if a full team step has just concluded.
-            - team_done (bool): 
-                True if the episode has ended for the team (either solved or max steps reached).
-                Determined only after a full team step.
-            - is_turn_for_next_marl_agent_in_team (bool): 
-                True if there is another MARL agent to act in the current team step.
-                False if the team step has just concluded (all agents have acted).
-            - info (Dict): 
-                Additional information, e.g., pass fraction, error summary after a team step.
         """
         env_s = self.env_states[env_idx]
         if env_s.get("episode_done", False):
@@ -307,6 +279,7 @@ class SHPPOCodeEnv:
         env_s["marl_agents_last_actions_str"][current_turn_agent_idx] = marl_agent_action_str
         env_s["marl_agents_llm_responses_this_turn"][current_turn_agent_idx] = marl_agent_llm_response
         
+        # Update team state based on agent's action type
         if marl_agent_action_str == "plan-subgoal": env_s["team_plan"] = marl_agent_llm_response
         elif marl_agent_action_str in ["generate-code", "patch-bug", "unit-fix", "optimize-code"]:
             extracted_code = extract_code_from_response(marl_agent_llm_response, self.code_pattern_for_extraction)
@@ -319,7 +292,7 @@ class SHPPOCodeEnv:
         team_done_for_this_turn = False
         info = {}
         next_agent_loc_obs = None
-        current_team_glob_state = self._get_team_global_state_components(env_idx) # Global state can be observed at any point
+        current_team_glob_state = self._get_team_global_state_components(env_idx)
 
         if is_team_step_over:
             env_s["episode_steps"] += 1
@@ -333,13 +306,12 @@ class SHPPOCodeEnv:
             )
 
             env_s["team_current_pass_fraction"] = final_pf
-            # Update error summary only if there's a new meaningful error, not "AllTestsPassed"
-            if final_err and not final_err.startswith("AllTestsPassed"):
+            if final_err and not final_err.startswith("AllTestsPassed"): # Update error summary if new meaningful error
                 env_s["team_errors_summary"] = final_err
-            elif solved: # If solved, clear previous errors.
+            elif solved: # If solved, clear previous errors
                  env_s["team_errors_summary"] = "AllTestsPassed"
 
-
+            # Reward calculation
             team_reward_for_this_turn = (final_pf - previous_team_pf) * 1.0 # Reward for improvement
             if final_pf == 1.0 and previous_team_pf < 1.0: team_reward_for_this_turn += 1.0 # Bonus for solving
             elif final_pf < previous_team_pf: team_reward_for_this_turn -= 0.1 # Penalty for regression
@@ -347,20 +319,18 @@ class SHPPOCodeEnv:
             team_done_for_this_turn = solved or (env_s["episode_steps"] >= self.cfg.max_team_episode_steps)
             env_s["episode_done"] = team_done_for_this_turn
             
-            env_s["current_marl_agent_turn"] = 0 
+            env_s["current_marl_agent_turn"] = 0 # Reset for next team step
             env_s["marl_agents_llm_responses_this_turn"] = ["" for _ in range(self.num_marl_agents)] 
             
             if not team_done_for_this_turn:
-                next_agent_loc_obs = self._get_current_marl_agent_local_obs_components(env_idx) # Obs for agent 0 of next team step
-            # Global state is updated based on the completed team step
+                next_agent_loc_obs = self._get_current_marl_agent_local_obs_components(env_idx)
             current_team_glob_state = self._get_team_global_state_components(env_idx) 
 
             info = {"team_pass_fraction": final_pf, "team_error": env_s["team_errors_summary"], "solved": solved}
             return next_agent_loc_obs, current_team_glob_state, team_reward_for_this_turn, team_done_for_this_turn, False, info
         else:
-            # Team step not over, get obs for the *next* agent in sequence
+            # Team step not over, get obs for the next agent in sequence
             next_agent_loc_obs = self._get_current_marl_agent_local_obs_components(env_idx)
-            # No team reward/done until team step is over
             return next_agent_loc_obs, current_team_glob_state, 0.0, False, True, {}
 
     def run_evaluation_and_save_csv(self, problem_task_pairs_with_final_team_code: List[Tuple[Dict, str]], csv_filepath: str):
@@ -368,7 +338,7 @@ class SHPPOCodeEnv:
         logger.info(f"Evaluation: Saving {len(problem_task_pairs_with_final_team_code)} team codes to {csv_filepath}")
         all_results:List[Dict[str,Any]] = []
         for task,code_str in tqdm(problem_task_pairs_with_final_team_code,desc="Evaluating Final Team Codes"):
-            if not task: # Skip if task data is missing
+            if not task: 
                 logger.warning("Skipping evaluation for an entry due to missing task data.")
                 continue
             res = evaluate_code_for_csv(task['name'],task['prompt'],code_str,task['tests_public'],task['time_limit'],
