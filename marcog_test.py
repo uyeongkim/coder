@@ -500,7 +500,7 @@ class CodeTester:
                 torch.cat([representative_llm_hidden_state_cpu.squeeze(0),
                            torch.tensor([problem_difficulty, problem_time_limit], dtype=model_dtype).cpu()], dim=-1)
             )
-            problem_ppo_data["actor_inputs_by_role"][role_name_main]["h_prevs"].append(agent_h_prevs[role_name_main][agent_idx_in_role_main].cpu())
+            problem_ppo_data["actor_inputs_by_role"][role_name_main]["h_prevs"].append(agent_h_prevs[role_name_main][agent_idx_in_role_main].squeeze(0).cpu())
             problem_ppo_data["actor_inputs_by_role"][role_name_main]["z_all_templates"].append(z_all_templates.cpu())
             problem_ppo_data["actor_inputs_by_role"][role_name_main]["old_log_probs"].append(chosen_action_log_prob.cpu())
             problem_ppo_data["actor_inputs_by_role"][role_name_main]["chosen_actions"].append(torch.tensor(chosen_action_flat_idx, dtype=torch.long).cpu())
