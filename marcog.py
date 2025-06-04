@@ -70,16 +70,18 @@ class Encoder(nn.Module):
 
     def forward(self, obs_emb: torch.Tensor, h_actor_prev: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         target_dtype = obs_emb.dtype
-        if obs_emb.dim() == 3:                      
+        if obs_emb.dim() == 3:                     
             B, T, F = obs_emb.shape
             obs_emb = obs_emb.view(B * T, F)        
+
             if h_actor_prev.dim() == 2:             
-                h_actor_prev = h_actor_prev.unsqueeze(1).repeat(1, T, 1)      
+                h_actor_prev = h_actor_prev.unsqueeze(1) \
+                                       .repeat(1, T, 1)      
             if h_actor_prev.dim() == 3:             
                 h_actor_prev = h_actor_prev.view(B * T, -1) 
 
         elif h_actor_prev.dim() == 3:
-            h_actor_prev = h_actor_prev.squeeze(1)            
+            h_actor_prev = h_actor_prev.squeeze(1)           
 
         x = torch.cat([obs_emb, h_actor_prev.to(target_dtype)], dim=-1)  
         x = self.encoder_mlp(x)
@@ -166,77 +168,89 @@ class HeteLayerDecoder(nn.Module):
 class ActorNet(nn.Module):
     def __init__(self, role_config: BaseRoleConfig, global_config: GlobalSHPPOConfig):
         super().__init__()
-        self.role_config = role_config
+        self.role_config   = role_config
         self.global_config = global_config
-        self.model_dtype = global_config.model_dtype
+        self.model_dtype   = global_config.model_dtype  
 
-        self.obs_encoder = MLPBlock(role_config.obs_embed_dim, global_config.actor_rnn_hidden_dim,
-                                    hidden_dim=global_config.mlp_hidden_dim, num_layers=1)
-        self.rnn = nn.GRU(global_config.actor_rnn_hidden_dim, global_config.actor_rnn_hidden_dim, batch_first=True)
+
+        self.obs_encoder = MLPBlock(
+            role_config.obs_embed_dim,
+            global_config.actor_rnn_hidden_dim,
+            hidden_dim = global_config.mlp_hidden_dim,
+            num_layers = 1,
+        )
+        self.rnn = nn.GRU(
+            global_config.actor_rnn_hidden_dim,
+            global_config.actor_rnn_hidden_dim,
+            batch_first = True,
+        )
         self.hete_layer_decoder = HeteLayerDecoder(global_config)
-        self.final_mlp = MLPBlock(global_config.hete_layer_output_dim, global_config.actor_final_mlp_output_dim,
-                                  hidden_dim=global_config.mlp_hidden_dim, num_layers=1)
-        self.policy_head = nn.Linear(global_config.actor_final_mlp_output_dim, 1)
+        self.final_mlp = MLPBlock(
+            global_config.hete_layer_output_dim,
+            global_config.actor_final_mlp_output_dim,
+            hidden_dim = global_config.mlp_hidden_dim,
+            num_layers = 1,
+        )
+        self.policy_head = nn.Linear(
+            global_config.actor_final_mlp_output_dim, 1
+        )
         self.policy_head.apply(lambda m: ortho_init(m, 0.01))
 
-    def forward(self, agent_obs_emb: torch.Tensor, agent_h_prev: torch.Tensor, z_all_templates_for_this_agent: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        target_dtype = self.model_dtype if self.model_dtype is not None else agent_obs_emb.dtype
-        batch_agent_size = agent_obs_emb.size(0)
+
+    def forward(
+        self,
+        agent_obs_emb: torch.Tensor,                 
+        agent_h_prev : torch.Tensor,                 
+        z_all_templates_for_this_agent: torch.Tensor 
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+
         
-        obs_features = self.obs_encoder(agent_obs_emb.to(target_dtype))
+        dtype = self.model_dtype or agent_obs_emb.dtype
+        B, N_tpl, D_z = z_all_templates_for_this_agent.shape
+
         
-        rnn_weight_dtype = self.rnn.weight_ih_l0.dtype
-        rnn_output, h_next_gru_unsq = self.rnn(
-            obs_features.unsqueeze(1).to(rnn_weight_dtype), 
-            agent_h_prev.unsqueeze(0).to(rnn_weight_dtype)
+        if agent_h_prev.dim() == 2:            
+            agent_h_prev = agent_h_prev.unsqueeze(0)
+        elif agent_h_prev.dim() == 3 and agent_h_prev.size(1) == 1:
+            agent_h_prev = agent_h_prev.permute(1, 0, 2)  
+
+        
+        obs_feat = self.obs_encoder(agent_obs_emb.to(dtype))          
+        rnn_out , h_next = self.rnn(obs_feat.unsqueeze(1), agent_h_prev.to(dtype))
+        h_t = rnn_out.squeeze(1)                                      
+
+        h_rep = h_t.unsqueeze(1).expand(B, N_tpl, -1)\
+                                 .reshape(-1, self.global_config.hete_layer_input_dim) 
+        z_flat = z_all_templates_for_this_agent.reshape(-1, D_z).to(dtype)              
+
+        W, b = self.hete_layer_decoder(z_flat)  
+        hete = torch.bmm(h_rep.unsqueeze(1), W.transpose(1, 2)).squeeze(1) + b          
+        feat_flat = self.final_mlp(hete)                                               
+        feat_by_tpl = feat_flat.view(B, N_tpl, -1)                                     
+
+        role_indices = (
+            PLANNER_ACTION_INDICES  if self.role_config.role_name == "planner" else
+            CODER_ACTION_INDICES    if self.role_config.role_name == "coder"   else
+            DEBUGGER_ACTION_INDICES
         )
-        actor_hidden_state = rnn_output.squeeze(1).to(target_dtype)
-        h_next_for_return = h_next_gru_unsq.squeeze(0).to(target_dtype)
+        valid_tpl_ids = sorted(role_indices)
 
-        actor_hidden_state_expanded = actor_hidden_state.unsqueeze(1).repeat(1, self.role_config.N_ACTION_TEMPLATES, 1)
-        actor_hidden_state_flat_for_hete = actor_hidden_state_expanded.reshape(-1, self.global_config.hete_layer_input_dim)
-        
-        z_flat_for_decoder = z_all_templates_for_this_agent.reshape(-1, self.global_config.latent_dim).to(target_dtype)
+        logits_chunks = []
+        for local_idx, global_idx in enumerate(valid_tpl_ids):
+            tpl_feat = feat_by_tpl[:, local_idx, :]
+            n_sample = ACTION_METADATA[IDX_TO_ACTION[global_idx]]["sample_count"]
+            tpl_feat_exp = tpl_feat.unsqueeze(1).expand(-1, n_sample, -1)\
+                                 .reshape(-1, self.global_config.actor_final_mlp_output_dim)
 
-        W_templates, b_templates = self.hete_layer_decoder(z_flat_for_decoder)
-        
-        hete_features_per_template = torch.bmm(
-            actor_hidden_state_flat_for_hete.unsqueeze(1), 
-            W_templates.transpose(1, 2) 
-        ).squeeze(1) + b_templates
-        
-        final_features_per_template_flat = self.final_mlp(hete_features_per_template)
-        final_features_viewed_by_template = final_features_per_template_flat.view(
-            batch_agent_size, self.role_config.N_ACTION_TEMPLATES, -1
-        )
+            logits_flat = self.policy_head(tpl_feat_exp.to(self.policy_head.weight.dtype))
+            logits_chunks.append(logits_flat.view(B, n_sample))
 
-        action_logits_list = []
-        current_role_action_indices = set()
-        if self.role_config.role_name == "planner": current_role_action_indices = PLANNER_ACTION_INDICES
-        elif self.role_config.role_name == "coder": current_role_action_indices = CODER_ACTION_INDICES
-        elif self.role_config.role_name == "debugger": current_role_action_indices = DEBUGGER_ACTION_INDICES
-        role_ordered_valid_global_indices = sorted(list(current_role_action_indices))
+        action_logits = torch.cat(logits_chunks, dim=1) if logits_chunks else \
+                        torch.empty(B, 0, device=agent_obs_emb.device, dtype=dtype)
 
-        for local_idx, global_template_idx in enumerate(role_ordered_valid_global_indices):
-            action_name = IDX_TO_ACTION[global_template_idx]
-            metadata = ACTION_METADATA[action_name]
-            sample_count = metadata["sample_count"]
-            template_features = final_features_viewed_by_template[:, local_idx, :]
-            expanded_template_features = template_features.unsqueeze(1).repeat(1, sample_count, 1)
-            flat_expanded_features = expanded_template_features.reshape(-1, self.global_config.actor_final_mlp_output_dim)
-            
-            policy_head_dtype = self.policy_head.weight.dtype
-            logits_for_samples_flat = self.policy_head(flat_expanded_features.to(policy_head_dtype))
-            logits_for_template_samples = logits_for_samples_flat.view(batch_agent_size, sample_count)
-            action_logits_list.append(logits_for_template_samples)
-        
-        if not action_logits_list:
-             action_logits = torch.empty(batch_agent_size, 0, device=agent_obs_emb.device, dtype=target_dtype)
-        else:
-            action_logits = torch.cat(action_logits_list, dim=1) 
+        action_probs = F.softmax(action_logits.to(torch.float32), dim=-1)
 
-        action_probs = F.softmax(action_logits.to(torch.float32), dim=-1) # Softmax는 float32에서 더 안정적
-        return action_logits, h_next_for_return, action_probs
+        return action_logits, h_next.squeeze(0).to(dtype), action_probs
 
 class CriticNet(nn.Module):
     def __init__(self, global_config: GlobalSHPPOConfig):
@@ -404,7 +418,6 @@ class SHPPOTrainer:
         if self.cfg.model_dtype is None: 
              self.cfg.model_dtype = torch.bfloat16 if device.type == 'cuda' and torch.cuda.is_bf16_supported() else torch.float32
              logger.warning(f"GlobalSHPPOConfig.model_dtype was not set, defaulting to {self.cfg.model_dtype}")
-
         network_components = build_networks(self.cfg, self.device)
         self.llm_model = network_components["llm_model"]
         self.tokenizer = network_components["tokenizer"]
@@ -418,10 +431,23 @@ class SHPPOTrainer:
                 self.trainable_params_flat_list.extend(param_list)
         if not self.trainable_params_flat_list:
             logger.warning("No trainable parameters found.")
-        self.optimizer = optim.AdamW(
-            self.trainable_params_flat_list, lr=cfg.init_lr, betas=(0.9, 0.999),
-            eps=1e-8, weight_decay=0.01,
-        )
+        actor_core_params, latent_params = [], []
+        critic_params    = list(self.critic_net.parameters())
+        infer_params     = list(self.inference_net.parameters())
+        lora_params      = self.all_trainable_parameters_grouped["llm_lora"]
+
+        for role, nets in self.role_networks.items():
+            actor_core_params.extend(nets["actor_net"].parameters())
+            latent_params    .extend(nets["latent_net"].parameters())
+
+        self.opt_actor     = optim.AdamW(list(actor_core_params) + list(lora_params),
+                                        lr=cfg.lr_actor, betas=(0.9, 0.999))
+        self.opt_critic    = optim.AdamW(critic_params, lr=cfg.lr_critic)
+        self.opt_latent    = optim.AdamW(latent_params, lr=cfg.lr_latent)
+        self.opt_inference = optim.AdamW(infer_params, lr=cfg.lr_infer)
+
+        
+        self.optimizer = self.opt_actor
         self.train_dataset = CodeContestDataset(split="train", max_problems=-1, max_cases=3)
         self.eval_dataset = CodeContestDataset(split="valid", max_problems=-1, max_cases=-1)
         self.test_dataset = CodeContestDataset(split="test", max_problems=-1, max_cases=-1)
@@ -477,234 +503,217 @@ class SHPPOTrainer:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         return advantages
 
-    def shppo_update(
-        self,
-        batch_of_problem_data: List[Dict[str, Any]], 
-    ) -> Dict[str, float]:
+    def shppo_update(self,
+                     batch_of_problem_data: List[Dict[str, Any]]
+                    ) -> Dict[str, float]:
+
         if not batch_of_problem_data:
-            logger.warning("Skipping SHPPO update due to empty batch.")
-            return {}
+            logger.warning("empty batch"); return {}
 
-        for role_name_key in self.role_networks:
-            self.role_networks[role_name_key]['actor_net'].train()
-            self.role_networks[role_name_key]['latent_net'].train()
-        self.critic_net.train()
-        self.inference_net.train()
-        if hasattr(self.llm_model, 'train'): self.llm_model.train()
+        cfg, dev        = self.cfg, self.device
+        f32             = torch.float32
+        bf              = cfg.model_dtype or torch.bfloat16   
 
-        cfg = self.cfg
-        model_dtype = self.cfg.model_dtype if self.cfg.model_dtype is not None else torch.bfloat16 # 기본값 bfloat16
-        float32_dtype = torch.float32 
+        R   = torch.tensor([d["final_reward"]
+                            for d in batch_of_problem_data],
+                           dtype=f32, device=dev)                             
+        V0  = torch.tensor([d["initial_value_prediction"]
+                            for d in batch_of_problem_data],
+                           dtype=bf,  device=dev)                             
+        Sg  = torch.stack([d["initial_global_state_embedding"]
+                           for d in batch_of_problem_data]).squeeze(1)        
+        Sg  = Sg.to(dev, dtype=bf)
+        Hc0 = torch.stack([d["initial_critic_hidden_state"]
+                           for d in batch_of_problem_data]).squeeze(1)        
+        Hc0 = Hc0.to(dev, dtype=bf)
 
-        rewards_batch = torch.stack([d["final_reward"] for d in batch_of_problem_data]).to(self.device, dtype=float32_dtype)
-        initial_value_predictions_batch = torch.stack([d["initial_value_prediction"] for d in batch_of_problem_data]).to(self.device, dtype=model_dtype)
-        initial_global_state_embeddings_batch = torch.stack([d["initial_global_state_embedding"] for d in batch_of_problem_data]).squeeze(1).to(self.device, dtype=model_dtype)
-        initial_critic_hidden_states_batch = torch.stack([d["initial_critic_hidden_state"] for d in batch_of_problem_data]).squeeze(1).to(self.device, dtype=model_dtype)
+        adv_per_problem = self.compute_advantages(R, V0.to(f32))              
 
-        all_mus_flat_for_inference_rollout_batch = torch.stack([d["all_mus_flat_for_inference"] for d in batch_of_problem_data]).to(self.device, dtype=model_dtype)
-        all_sigmas_flat_for_inference_rollout_batch = torch.stack([d["all_sigmas_flat_for_inference"] for d in batch_of_problem_data]).to(self.device, dtype=model_dtype)
-        
-        advantages_problem_level = self.compute_advantages(rewards_batch, initial_value_predictions_batch.to(float32_dtype))
-
-        final_actor_inputs_by_role: Dict[str, Dict[str, torch.Tensor]] = {}
-        actor_inputs_by_role_flattened: Dict[str, Dict[str, List[torch.Tensor]]] = {
-            role: {"obs_embs": [], "h_prevs": [], "z_all_templates": [], "old_log_probs": [], "chosen_actions": [], "advantages": []}
-            for role in self.role_networks.keys()
-        }
-        for problem_idx, problem_data in enumerate(batch_of_problem_data):
-            current_problem_advantage = advantages_problem_level[problem_idx] 
-            for role_name_key in self.role_networks.keys():
-                role_turn_data = problem_data["actor_inputs_by_role"].get(role_name_key)
-                if role_turn_data and role_turn_data["obs_embs"].numel() > 0:
-                    actor_inputs_by_role_flattened[role_name_key]["obs_embs"].append(role_turn_data["obs_embs"].to(model_dtype))
-                    actor_inputs_by_role_flattened[role_name_key]["h_prevs"].append(role_turn_data["h_prevs"].to(model_dtype))
-                    actor_inputs_by_role_flattened[role_name_key]["z_all_templates"].append(role_turn_data["z_all_templates"].to(model_dtype))
-                    actor_inputs_by_role_flattened[role_name_key]["old_log_probs"].append(role_turn_data["old_log_probs"].to(float32_dtype))
-                    actor_inputs_by_role_flattened[role_name_key]["chosen_actions"].append(role_turn_data["chosen_actions"]) # long
-                    num_turns_for_role_in_problem = role_turn_data["old_log_probs"].size(0)
-                    advantages_for_turns = current_problem_advantage.repeat(num_turns_for_role_in_problem)
-                    actor_inputs_by_role_flattened[role_name_key]["advantages"].append(advantages_for_turns.to(float32_dtype))
-
-        for role_name_key, data_lists in actor_inputs_by_role_flattened.items():
-            final_actor_inputs_by_role[role_name_key] = {}
-            role_cfg_for_dims = getattr(cfg, f"{role_name_key}_role_config")
-            for field, list_of_tensors in data_lists.items():
-                if list_of_tensors:
-                    final_actor_inputs_by_role[role_name_key][field] = torch.cat(list_of_tensors, dim=0).to(self.device)
-                else: 
-                    default_dtype_for_empty = model_dtype
-                    if field in ["old_log_probs", "advantages"]: default_dtype_for_empty = float32_dtype
-                    elif field == "chosen_actions": default_dtype_for_empty = torch.long
-                    if field == "obs_embs": shape = (0, role_cfg_for_dims.obs_embed_dim)
-                    elif field == "h_prevs": shape = (0, cfg.actor_rnn_hidden_dim)
-                    elif field == "z_all_templates": shape = (0, role_cfg_for_dims.N_ACTION_TEMPLATES, cfg.latent_dim)
-                    else: shape = (0,)
-                    final_actor_inputs_by_role[role_name_key][field] = torch.empty(shape, device=self.device, dtype=default_dtype_for_empty)
-
-        epoch_losses = {
-            "policy_loss": 0.0, "critic_value_loss": 0.0, "latent_value_loss": 0.0,
-            "latent_entropy_loss": 0.0, "latent_diversity_loss": 0.0,
-            "inference_loss": 0.0, "actor_entropy": 0.0, "total_combined_loss": 0.0
+        turn2prob: list[int] = []                                             
+        flat = {
+            r: {k: [] for k in ("obs", "h", "act", "oldlp", "adv")}
+            for r in self.role_networks
         }
 
-        for epoch in range(cfg.epochs):
-            self.optimizer.zero_grad()
+        for p_idx, pdata in enumerate(batch_of_problem_data):
+            for role, nets in self.role_networks.items():
+                t = pdata["actor_inputs_by_role"].get(role)
+                if t is None or t["obs_embs"].numel() == 0:
+                    continue
 
-            current_critic_values, _ = self.critic_net(
-                initial_global_state_embeddings_batch, 
-                initial_critic_hidden_states_batch    
-            )
-            if cfg.value_loss_clipping:
-                value_pred_clipped = initial_value_predictions_batch + torch.clamp(
-                    current_critic_values - initial_value_predictions_batch,
-                    -cfg.value_clip_range, cfg.value_clip_range
+                n_turn = t["old_log_probs"].size(0)
+                flat[role]["obs"  ].append(t["obs_embs"].to(bf))
+                flat[role]["h"    ].append(t["h_prevs"  ].to(bf))
+                flat[role]["act"  ].append(t["chosen_actions"].long())
+                flat[role]["oldlp"].append(t["old_log_probs"].to(f32))
+                flat[role]["adv"  ].append(
+                    adv_per_problem[p_idx].repeat(n_turn)
                 )
-                value_losses_unclipped = (current_critic_values.to(float32_dtype) - rewards_batch) ** 2
-                value_losses_clipped = (value_pred_clipped.to(float32_dtype) - rewards_batch) ** 2
-                value_loss_critic = 0.5 * torch.max(value_losses_unclipped, value_losses_clipped).mean()
-            else:
-                value_loss_critic = F.mse_loss(current_critic_values.to(float32_dtype), rewards_batch)
-            epoch_losses["critic_value_loss"] += value_loss_critic.item()
-            
-            actor_policy_loss_terms = []
-            actor_entropy_terms = []
-            current_LN_outputs_by_role_flat: Dict[str, Dict[str, torch.Tensor]] = {}
-            current_z_for_diversity_by_role_list: Dict[str, List[torch.Tensor]] = {role_k: [] for role_k in self.role_networks.keys()}
+                turn2prob.extend([p_idx] * n_turn)
 
-            for role_name_key, nets_for_role in self.role_networks.items():
-                actor_net = nets_for_role["actor_net"]
-                latent_net = nets_for_role["latent_net"]
-                role_specific_data = final_actor_inputs_by_role[role_name_key]
+        for role in flat:
+            for k in flat[role]:
+                flat[role][k] = (torch.cat(flat[role][k]).to(dev)
+                                 if flat[role][k] else
+                                 torch.empty(0, device=dev))
 
-                if role_specific_data["obs_embs"].numel() > 0:
-                    current_z, current_mu, current_sigma = latent_net(
-                        role_specific_data["obs_embs"], 
-                        role_specific_data["h_prevs"]
-                    )
-                    current_LN_outputs_by_role_flat[role_name_key] = {
-                        "mu_flat": current_mu.reshape(current_mu.size(0), -1),
-                        "sigma_flat": current_sigma.reshape(current_sigma.size(0), -1),
-                        "mu_orig_shape": current_mu, 
-                        "sigma_orig_shape": current_sigma 
-                    }
-                    current_z_for_diversity_by_role_list[role_name_key].append(current_z.mean(dim=1))
-                    new_action_logits, _, new_action_probs = actor_net(
-                        role_specific_data["obs_embs"],
-                        role_specific_data["h_prevs"],
-                        current_z 
-                    )
-                    dist = Categorical(logits=new_action_logits.to(float32_dtype))
-                    new_log_probs = dist.log_prob(role_specific_data["chosen_actions"])
-                    ratios = (new_log_probs - role_specific_data["old_log_probs"]).exp()
-                    clipped_ratios = torch.clamp(ratios, 1.0 - cfg.clip_eps, 1.0 + cfg.clip_eps)
-                    advantages_for_role_turns = role_specific_data["advantages"]
-                    policy_loss_for_role = -torch.min(ratios * advantages_for_role_turns,
-                                                      clipped_ratios * advantages_for_role_turns).mean()
-                    actor_policy_loss_terms.append(policy_loss_for_role)
-                    entropy_for_role = dist.entropy().mean()
-                    actor_entropy_terms.append(entropy_for_role)
+        if all(flat[r]["obs"].numel() == 0 for r in flat):
+            return {}   
 
-            mus_for_Lv_current_LN_batch_list = []
-            sigmas_for_Lv_current_LN_batch_list = []
-            all_problems_current_sigmas_for_Le = [] 
-            all_problems_current_z_for_Ld = []    
-            turn_counters_for_roles_reconstruct = {role_k: 0 for role_k in self.role_networks.keys() if role_k in current_LN_outputs_by_role_flat}
+        all_adv = torch.cat([flat[r]["adv"] for r in flat])
+        if all_adv.numel() > 1:                      
+            std = all_adv.std(unbiased=False)        
+            if std > 1e-8:
+                all_adv = (all_adv - all_adv.mean()) / (std + 1e-8)
+            else:                                    
+                all_adv = all_adv - all_adv.mean()
+        else:                                       
+            all_adv = all_adv - all_adv.mean()
 
-            for problem_data_item in batch_of_problem_data:
-                mus_sequence_for_this_problem_Lv = []
-                sigmas_sequence_for_this_problem_Lv = []
-                sigmas_orig_shape_for_this_problem_Le = []
-                z_mean_for_this_problem_Ld = []
-                for role_name_in_pipeline in problem_data_item["turn_agent_role_names"]:
-                    if role_name_in_pipeline in current_LN_outputs_by_role_flat:
-                        current_turn_idx_for_role = turn_counters_for_roles_reconstruct[role_name_in_pipeline]
-                        mu_this_turn_flat = current_LN_outputs_by_role_flat[role_name_in_pipeline]["mu_flat"][current_turn_idx_for_role]
-                        sigma_this_turn_flat = current_LN_outputs_by_role_flat[role_name_in_pipeline]["sigma_flat"][current_turn_idx_for_role]
-                        mus_sequence_for_this_problem_Lv.append(mu_this_turn_flat)
-                        sigmas_sequence_for_this_problem_Lv.append(sigma_this_turn_flat)
-                        sigma_orig_this_turn = current_LN_outputs_by_role_flat[role_name_in_pipeline]["sigma_orig_shape"][current_turn_idx_for_role]
-                        sigmas_orig_shape_for_this_problem_Le.append(sigma_orig_this_turn)
-                        z_mean_this_turn = current_z_for_diversity_by_role_list[role_name_in_pipeline][0][current_turn_idx_for_role] 
-                        z_mean_for_this_problem_Ld.append(z_mean_this_turn)
-                        turn_counters_for_roles_reconstruct[role_name_in_pipeline] += 1
-                if mus_sequence_for_this_problem_Lv:
-                    mus_for_Lv_current_LN_batch_list.append(torch.cat(mus_sequence_for_this_problem_Lv))
-                    sigmas_for_Lv_current_LN_batch_list.append(torch.cat(sigmas_sequence_for_this_problem_Lv))
-                    if sigmas_orig_shape_for_this_problem_Le: all_problems_current_sigmas_for_Le.append(torch.stack(sigmas_orig_shape_for_this_problem_Le)) 
-                    if z_mean_for_this_problem_Ld: all_problems_current_z_for_Ld.append(torch.stack(z_mean_for_this_problem_Ld))       
+        offset = 0
+        for role in flat:
+            n = flat[role]["adv"].size(0)
+            flat[role]["adv"] = all_adv[offset:offset + n]
+            offset += n
 
-            if mus_for_Lv_current_LN_batch_list:
-                mus_for_Lv_current_LN_batch = torch.stack(mus_for_Lv_current_LN_batch_list)
-                sigmas_for_Lv_current_LN_batch = torch.stack(sigmas_for_Lv_current_LN_batch_list)
-                V_I_for_latent_loss = self.inference_net(
-                    initial_global_state_embeddings_batch,
-                    mus_for_Lv_current_LN_batch,
-                    sigmas_for_Lv_current_LN_batch
-                )
-            else:
-                V_I_for_latent_loss = torch.zeros_like(rewards_batch) 
-            L_v_component = -V_I_for_latent_loss.mean()
-            epoch_losses["latent_value_loss"] += L_v_component.item()
+        turn2prob_t = torch.as_tensor(turn2prob, device=dev)                  
 
-            entropies_all_turns = []
-            for role_name_k in current_LN_outputs_by_role_flat:
-                if "sigma_orig_shape" in current_LN_outputs_by_role_flat[role_name_k] and \
-                   current_LN_outputs_by_role_flat[role_name_k]["sigma_orig_shape"].numel() > 0:
-                    current_sigmas_role_orig_shape = current_LN_outputs_by_role_flat[role_name_k]["sigma_orig_shape"]
-                    log_sigma_sq_role = 2 * torch.log(current_sigmas_role_orig_shape.clamp(min=1e-9)) # clamp 추가
-                    entropy_per_dim_template_role = 0.5 * (1 + math.log(2 * math.pi) + log_sigma_sq_role)
-                    entropy_per_template_role = torch.sum(entropy_per_dim_template_role, dim=-1) 
-                    entropy_per_turn_role = entropy_per_template_role.mean(dim=-1) 
-                    entropies_all_turns.append(entropy_per_turn_role)
-            if entropies_all_turns:
-                final_entropy_all_turns = torch.cat(entropies_all_turns) 
-                mean_entropy_current_latents = final_entropy_all_turns.mean()
-                latent_entropy_contrib = cfg.lambda_entropy_latent * mean_entropy_current_latents 
-            else:
-                latent_entropy_contrib = torch.tensor(0.0, device=self.device, dtype=model_dtype)
-            epoch_losses["latent_entropy_loss"] += latent_entropy_contrib.item()
+        stats = dict(actor=0., entropy=0., critic=0.,
+                     latent=0., infer=0.)
+        nA = nC = nL = nI = 0
 
-            if all_problems_current_z_for_Ld:
-                flat_current_z_for_Ld = torch.cat([z_problem for z_problem in all_problems_current_z_for_Ld if z_problem.numel() >0 ], dim=0) 
-                if flat_current_z_for_Ld.numel() > 0:
-                    L_d_val_current = cosine_diversity(flat_current_z_for_Ld.unsqueeze(0)) 
-                else:
-                    L_d_val_current = torch.tensor(0.0, device=self.device, dtype=model_dtype)
-                latent_diversity_contrib = -cfg.lambda_diversity_latent * L_d_val_current 
-            else:
-                latent_diversity_contrib = torch.tensor(0.0, device=self.device, dtype=model_dtype)
-            epoch_losses["latent_diversity_loss"] += latent_diversity_contrib.item()
+        # ========================= 1) ACTOR =========================
+        for role, nets in self.role_networks.items():
+            if flat[role]["obs"].numel() == 0:
+                continue
 
-            latent_loss = L_v_component + latent_entropy_contrib + latent_diversity_contrib
-            total_policy_loss_actor = sum(actor_policy_loss_terms) if actor_policy_loss_terms else torch.tensor(0.0, device=self.device, dtype=float32_dtype)
-            total_entropy_actor = sum(actor_entropy_terms) if actor_entropy_terms else torch.tensor(0.0, device=self.device, dtype=float32_dtype)
-            actor_entropy_loss_term = -cfg.ent_coef_actor * total_entropy_actor
-            epoch_losses["policy_loss"] += total_policy_loss_actor.item()
-            epoch_losses["actor_entropy"] += total_entropy_actor.item()
+            actnet, latnet = nets["actor_net"], nets["latent_net"]
+            O, H, A, OLP, ADV = (flat[role][k] for k in
+                                 ("obs", "h", "act", "oldlp", "adv"))
 
-            V_I_for_inference_loss = self.inference_net( 
-                initial_global_state_embeddings_batch,
-                all_mus_flat_for_inference_rollout_batch, 
-                all_sigmas_flat_for_inference_rollout_batch   
-            )
-            inference_loss = F.mse_loss(V_I_for_inference_loss.to(float32_dtype), rewards_batch)
-            epoch_losses["inference_loss"] += inference_loss.item()
-            
-            combined_loss = (
-                total_policy_loss_actor
-                + actor_entropy_loss_term
-                + cfg.vf_coef * value_loss_critic
-                + latent_loss.to(float32_dtype) 
-                + inference_loss
-            )
-            epoch_losses["total_combined_loss"] += combined_loss.item()
-            combined_loss.backward()
-            if self.trainable_params_flat_list:
-                torch.nn.utils.clip_grad_norm_(self.trainable_params_flat_list, cfg.max_grad_norm)
-            self.optimizer.step()
+            M     = O.size(0)
+            bsize = max(1, M // cfg.num_minibatches)
+            perm  = torch.randperm(M, device=dev)
 
-        avg_losses = {k: v / cfg.epochs for k, v in epoch_losses.items()}
-        return avg_losses
+            for s in range(0, M, bsize):
+                mb  = perm[s:s + bsize]
+                o_b = O[mb].detach()
+                h_b = H[mb].detach()
+
+                with torch.no_grad():
+                    z_b, _, _ = latnet(o_b, h_b)              
+
+                logits_b, *_ = actnet(o_b, h_b, z_b)          
+                dist        = Categorical(logits=logits_b.to(f32))
+
+                ratio = torch.exp(dist.log_prob(A[mb]) - OLP[mb])
+                surr1 = ratio * ADV[mb]
+                surr2 = torch.clamp(ratio, 1 - cfg.clip_eps, 1 + cfg.clip_eps) * ADV[mb]
+                lossA = -torch.min(surr1, surr2).mean() \
+                        - cfg.ent_coef_actor * dist.entropy().mean()
+
+                self.opt_actor.zero_grad()
+                lossA.backward()
+                nA += 1
+
+                stats["actor"]   += lossA.item()
+                stats["entropy"] += dist.entropy().mean().item()
+
+            torch.nn.utils.clip_grad_norm_(actnet.parameters(), cfg.max_grad_norm)
+            self.opt_actor.step()
+
+        # ========================= 2) CRITIC =========================
+        B      = R.size(0)
+        bsizeT = max(1, B // cfg.num_minibatches)
+        permT  = torch.randperm(B, device=dev)
+
+        for s in range(0, B, bsizeT):
+            mb     = permT[s:s + bsizeT]
+            v_pred, _ = self.critic_net(Sg[mb], Hc0[mb])      
+            target    = R[mb].to(v_pred.dtype)
+
+            v_pred_flat = v_pred.view(-1)                     
+            target_flat = target.view(-1)                     
+
+            lossV = F.mse_loss(v_pred_flat.to(f32),
+                            target_flat) * cfg.vf_coef
+            self.opt_critic.zero_grad()
+            lossV.backward()
+            nC += 1
+
+        torch.nn.utils.clip_grad_norm_(self.critic_net.parameters(),
+                                       cfg.max_grad_norm)
+        self.opt_critic.step()
+        stats["critic"] += lossV.item()
+
+        # ================= 3) LATENT  &  4) INFERENCE ================
+        for role, nets in self.role_networks.items():
+            if flat[role]["obs"].numel() == 0:
+                continue
+
+            latnet = nets["latent_net"]
+            O, H = flat[role]["obs"], flat[role]["h"]
+
+            M     = O.size(0)
+            bsize = max(1, M // cfg.num_minibatches)
+            perm  = torch.randperm(M, device=dev)
+
+            for s in range(0, M, bsize):
+                mb   = perm[s:s + bsize]
+                o_b  = O[mb]
+                h_b  = H[mb]
+                gidx = turn2prob_t[mb]                        
+
+                z, mu, sig = latnet(o_b, h_b)                
+                sig32 = sig.float().clamp(min=1e-6)          
+
+                entropy_lat = (
+                    0.5 * cfg.latent_dim * (1 + math.log(2 * math.pi))
+                    + torch.log(sig32).sum(-1)
+                ).mean()
+
+                diversity_lat = cosine_diversity(z.mean(1).unsqueeze(0)) 
+                V_I_lat = self.inference_net(
+                    Sg[gidx],
+                    mu.reshape(len(mb), -1),
+                    sig.reshape(len(mb), -1)
+                )                                                       
+
+                lossL = (-cfg.lambda_V_I_guidance_for_latent * V_I_lat.float().mean()
+                         + cfg.lambda_entropy_latent   * entropy_lat
+                         - cfg.lambda_diversity_latent * diversity_lat)
+
+                self.opt_latent.zero_grad()
+                lossL.backward()
+                nL += 1
+
+                torch.nn.utils.clip_grad_norm_(latnet.parameters(),
+                                               cfg.max_grad_norm)
+                self.opt_latent.step()
+                stats["latent"] += lossL.item()
+
+                # 3-b) Inference (MSE) loss
+                mu_det  = mu.detach().reshape(len(mb), -1)   
+                sig_det = sig.detach().reshape(len(mb), -1)  
+                V_I2    = self.inference_net(Sg[gidx], mu_det, sig_det)  
+
+                loss_inf = F.mse_loss(V_I2.float(), R[gidx]) * cfg.lambda_inf_mse
+                self.opt_inference.zero_grad()
+                loss_inf.backward()
+                torch.nn.utils.clip_grad_norm_(self.inference_net.parameters(), cfg.max_grad_norm)
+                self.opt_inference.step()
+                stats["infer"] += loss_inf.item(); nI += 1
+
+        if nA:
+            stats["actor"]   /= nA
+            stats["entropy"] /= nA
+        if nC: stats["critic"] /= nC
+        if nL: stats["latent"] /= nL
+        if nI: stats["infer"]  /= nI
+
+        return stats
+
+
 
     def train(self, updates: Optional[int] = None):
         num_updates = updates if updates is not None else self.cfg.updates

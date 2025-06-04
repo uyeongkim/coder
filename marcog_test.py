@@ -560,8 +560,10 @@ class CodeTester:
 
         # --- Data Cleanup and Return ---
         if temp_all_agents_mu_flat_list:
-            problem_ppo_data["all_mus_flat_for_inference"] = torch.cat(temp_all_agents_mu_flat_list, dim=-1)
-            problem_ppo_data["all_sigmas_flat_for_inference"] = torch.cat(temp_all_agents_sigma_flat_list, dim=-1)
+            problem_ppo_data["all_mus_flat_for_inference"] = torch.cat(temp_all_agents_mu_flat_list, dim=-1).squeeze(0)
+
+            problem_ppo_data["all_sigmas_flat_for_inference"] = torch.cat(temp_all_agents_sigma_flat_list, dim=-1).squeeze(0)
+
         else:
             total_expected_flat_latent_dim = 0
             for role_cfg_name_calc in ["planner", "coder", "debugger"]:

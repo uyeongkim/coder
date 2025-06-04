@@ -90,19 +90,25 @@ class GlobalSHPPOConfig:
     lora_dropout: float = 0.05
     llm_actual_hidden_size: Optional[int] = None
 
-    total_planner_agents: int = 0
-    total_coder_agents: int = 1
-    total_debugger_agents: int = 0
+    total_planner_agents: int = 3
+    total_coder_agents: int = 3
+    total_debugger_agents: int = 2
 
     total_agents_in_pipeline: int = field(init=False)
-
-    gamma: float = 0.99
+    lr_actor : float = 5e-4         
+    lr_critic: float = 5e-4
+    lr_latent: float = 5e-4
+    lr_infer : float = 5e-3
+    lambda_V_I_guidance_for_latent = 1.0
+    lambda_inf_mse =1
+    num_minibatches: int = 1  
+    gamma: float = 0.95
     lam: float = 0.95
     updates: int = 1000
     epochs: int = 4
-    num_problems_per_batch: int = 6
+    num_problems_per_batch: int = 1
     
-    clip_eps: float = 0.1
+    clip_eps: float = 0.2
     vf_coef: float = 0.5
     ent_coef_actor: float = 0.005
     max_grad_norm: float = 0.3
@@ -134,7 +140,7 @@ class GlobalSHPPOConfig:
     value_loss_clipping: bool = True
     value_clip_range: float = 0.1
 
-    wandb_project_name: str = "SHPPO_Unified_Inference_Pipeline"
+    wandb_project_name: str = "SHPPO"
     wandb_run_name_prefix: str = "run"
     log_interval: int = 1
     evaluate_interval: int = 5
