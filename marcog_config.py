@@ -82,10 +82,10 @@ class GlobalSHPPOConfig:
     lora_target_modules: List[str] = field(default_factory=lambda: ["q_proj", "v_proj", "k_proj", "o_proj"])
     lora_dropout: float = 0.05
     llm_actual_hidden_size: Optional[int] = None
-    num_problems_per_batch: int = 1
-    total_planner_agents: int = 0
-    total_coder_agents: int = 1
-    total_debugger_agents: int = 0
+    num_problems_per_batch: int = 4
+    total_planner_agents: int = 3
+    total_coder_agents: int = 3
+    total_debugger_agents: int = 3
     use_gae: bool = True
     total_agents_in_pipeline: int = field(init=False)
     lr_actor : float = 5e-4         
