@@ -4,29 +4,22 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Any, Tuple, Dict
 import math
 import torch
-# 각 액션 템플릿에 대한 메타데이터 정의
-# uses_llm: LLM 생성이 필요한 템플릿인지
-# sample_count: uses_llm=True일 경우 생성할 LLM 후보 개수
-# is_fixed_response: LLM 호출 없이 고정된 응답(예: 빈 문자열)을 사용하는지
+
 ACTION_METADATA = {
     "plan-subgoal":    {"uses_llm": True, "sample_count": 4, "is_fixed_response": False},
     "generate-code":   {"uses_llm": True, "sample_count": 4, "is_fixed_response": False},
     "fix-code":        {"uses_llm": True, "sample_count": 4, "is_fixed_response": False},
-    "noop":            {"uses_llm": False, "sample_count": 1, "is_fixed_response": True}, # noop은 LLM 호출 없고, 빈 응답 하나
-    # "rephrase_prompt": {"uses_llm": True, "sample_count": 4, "is_fixed_response": False}, # 플래너에 추가하고 싶다면
+    "noop":            {"uses_llm": False, "sample_count": 1, "is_fixed_response": True}, 
 }
 
-# 기존 ACTION_TEMPLATES는 ActorNet의 순서를 위해 유지
-ACTION_TEMPLATES: Tuple[str, ...] = tuple(ACTION_METADATA.keys()) # 이제 메타데이터에서 키를 가져옴
+ACTION_TEMPLATES: Tuple[str, ...] = tuple(ACTION_METADATA.keys()) 
 ACTION_TO_IDX: Dict[str, int] = {action_name: i for i, action_name in enumerate(ACTION_TEMPLATES)}
 IDX_TO_ACTION: Dict[int, str] = {i: action_name for i, action_name in enumerate(ACTION_TEMPLATES)}
 
 
-# 각 역할별로 유효한 액션 인덱스와 해당 액션의 총 샘플 공간 크기 계산
 def _calculate_role_action_space_size(action_indices: set[int]) -> int:
     total_size = 0
-    # Iterate in a defined order (e.g., sorted by global action index) for consistency
-    for idx in sorted(list(action_indices)): # MODIFIED HERE
+    for idx in sorted(list(action_indices)): 
         action_name = IDX_TO_ACTION[idx]
         total_size += ACTION_METADATA[action_name]["sample_count"]
     return total_size
@@ -42,7 +35,7 @@ class BaseRoleConfig:
     num_agents_in_role: int = 0
     obs_embed_dim: int = 0
 
-    N_ACTION_TEMPLATES: int = 0 # Number of valid action templates for this role
+    N_ACTION_TEMPLATES: int = 0 
     role_action_space_size: int = field(init=False, repr=False) # Total number of choices in the flattened action space for this role
     def __post_init__(self):
         
@@ -83,17 +76,17 @@ class DebuggerConfig(BaseRoleConfig):
 @dataclass
 class GlobalSHPPOConfig:
     model_dtype: torch.dtype = torch.bfloat16
-    llm_model_name: str = "Qwen/Qwen2.5-Coder-32B-Instruct"
+    llm_model_name: str =  "Qwen/Qwen2.5-Coder-32B-Instruct"
     lora_r: int = 8
     lora_alpha: int = 16
     lora_target_modules: List[str] = field(default_factory=lambda: ["q_proj", "v_proj", "k_proj", "o_proj"])
     lora_dropout: float = 0.05
     llm_actual_hidden_size: Optional[int] = None
-
-    total_planner_agents: int = 3
-    total_coder_agents: int = 3
-    total_debugger_agents: int = 2
-
+    num_problems_per_batch: int = 1
+    total_planner_agents: int = 0
+    total_coder_agents: int = 1
+    total_debugger_agents: int = 0
+    use_gae: bool = True
     total_agents_in_pipeline: int = field(init=False)
     lr_actor : float = 5e-4         
     lr_critic: float = 5e-4
@@ -103,10 +96,10 @@ class GlobalSHPPOConfig:
     lambda_inf_mse =1
     num_minibatches: int = 1  
     gamma: float = 0.95
+    gae_lambda: float = 0.95
     lam: float = 0.95
     updates: int = 1000
     epochs: int = 4
-    num_problems_per_batch: int = 1
     
     clip_eps: float = 0.2
     vf_coef: float = 0.5
@@ -140,7 +133,7 @@ class GlobalSHPPOConfig:
     value_loss_clipping: bool = True
     value_clip_range: float = 0.1
 
-    wandb_project_name: str = "SHPPO"
+    wandb_project_name: str = "SHPPO_Unified_Inference_Pipeline"
     wandb_run_name_prefix: str = "run"
     log_interval: int = 1
     evaluate_interval: int = 5

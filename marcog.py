@@ -472,9 +472,14 @@ class SHPPOTrainer:
 
     def update_learning_rate(self, current_update: int):
         new_lr = self.cfg.get_learning_rate(current_update)
-        for param_group in self.optimizer.param_groups:
-            param_group['lr'] = new_lr
+        for opt in (self.opt_actor,
+                    self.opt_critic,
+                    self.opt_latent,
+                    self.opt_inference):
+            for pg in opt.param_groups:
+                pg["lr"] = new_lr
         return new_lr
+
 
     def sample_problems(self, num_problems: int) -> List[Dict[str, Any]]:
         all_tasks = self.train_dataset.get_all_tasks()
@@ -497,91 +502,103 @@ class SHPPOTrainer:
             all_problem_data_for_batch.append(collected_data_for_this_problem)
         return all_problem_data_for_batch
 
-    def compute_advantages(self, rewards: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
-        advantages = rewards - values 
-        if self.cfg.use_gae_normalization and advantages.numel() > 1 and advantages.std() > 1e-8:
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        return advantages
+    def compute_advantages(self, rewards: torch.Tensor,
+                       values:  torch.Tensor) -> torch.Tensor:
+        if self.cfg.use_gae:
+            gamma, lam = self.cfg.gamma, self.cfg.gae_lambda
+            gae = 0.0
+            adv = torch.zeros_like(rewards, dtype=torch.float32)
+            for t in reversed(range(rewards.size(0))):
+                delta = rewards[t] + gamma * (values[t + 1] if t + 1 < rewards.size(0) else 0.0) - values[t]
+                gae   = delta + gamma * lam * gae
+                adv[t] = gae
+        else:
+            adv = rewards - values
 
+        if self.cfg.use_gae_normalization and adv.numel() > 1:
+            std = adv.std(unbiased=False)
+            adv = (adv - adv.mean()) / (std + 1e-8) if std > 1e-8 else adv - adv.mean()
+        return adv
+
+
+    from torch.distributions import Categorical
+    import torch.nn.functional as F
+    import math, torch
+    from typing import List, Dict, Any
+
+    # --------------------------------------------------------------
     def shppo_update(self,
-                     batch_of_problem_data: List[Dict[str, Any]]
+                    batch_of_problem_data: List[Dict[str, Any]]
                     ) -> Dict[str, float]:
-
+        """
+        One PPO update for SHPPO.
+        Works with current GlobalSHPPOConfig:
+        - model_dtype = bf16
+        - only coder agents active
+        - use_gae = True
+        - num_minibatches = 1 (no shuffling effect but safe)
+        """
         if not batch_of_problem_data:
-            logger.warning("empty batch"); return {}
+            self.logger.warning("empty batch")
+            return {}
 
-        cfg, dev        = self.cfg, self.device
-        f32             = torch.float32
-        bf              = cfg.model_dtype or torch.bfloat16   
+        cfg, dev = self.cfg, self.device
+        f32, bf = torch.float32, cfg.model_dtype or torch.bfloat16
 
-        
-        R   = torch.tensor([d["final_reward"]
-                            for d in batch_of_problem_data],
-                           dtype=f32, device=dev)                             
-        V0  = torch.tensor([d["initial_value_prediction"]
-                            for d in batch_of_problem_data],
-                           dtype=bf,  device=dev)                             
+        # ────── problem-level tensors ──────
+        R  = torch.as_tensor([d["final_reward"] for d in batch_of_problem_data],
+                            dtype=f32, device=dev)               # (B,)
+        V0 = torch.as_tensor([d["initial_value_prediction"] for d in batch_of_problem_data],
+                            dtype=bf,  device=dev)               # (B,)
 
         Sg  = torch.stack([d["initial_global_state_embedding"]
-                           for d in batch_of_problem_data]).squeeze(1)
-        Sg  = Sg.to(dev, dtype=bf)
-
+                        for d in batch_of_problem_data]).squeeze(1).to(dev, dtype=bf)
         Hc0 = torch.stack([d["initial_critic_hidden_state"]
-                           for d in batch_of_problem_data]).squeeze(1)
-        Hc0 = Hc0.to(dev, dtype=bf)
+                        for d in batch_of_problem_data]).squeeze(1).to(dev, dtype=bf)
 
-        adv_per_problem = self.compute_advantages(R, V0.to(f32))
+        adv_per_problem = self.compute_advantages(R, V0.to(f32))  # (B,)
 
-        turn2prob: list[int] = []                                             
-        flat = {
-            r: {k: [] for k in ("obs", "h", "act", "oldlp", "adv")}
-            for r in self.role_networks
-        }
+        # ────── flatten turn-level rollout ──────
+        turn2prob: list[int] = []
+        flat = {r: {k: [] for k in ("obs", "h", "act", "oldlp", "adv")}
+                for r in self.role_networks}
 
         for p_idx, pdata in enumerate(batch_of_problem_data):
-            for role, nets in self.role_networks.items():
+            for role in self.role_networks:
                 t = pdata["actor_inputs_by_role"].get(role)
                 if t is None or t["obs_embs"].numel() == 0:
                     continue
-
                 n_turn = t["old_log_probs"].size(0)
-                flat[role]["obs"  ].append(t["obs_embs"].to(bf))
-                flat[role]["h"    ].append(t["h_prevs"  ].to(bf))
-                flat[role]["act"  ].append(t["chosen_actions"].long())
+                flat[role]["obs"].append(t["obs_embs"].to(bf))
+                flat[role]["h"].append(t["h_prevs"].to(bf))
+                flat[role]["act"].append(t["chosen_actions"].long())
                 flat[role]["oldlp"].append(t["old_log_probs"].to(f32))
-                flat[role]["adv"  ].append(
+                flat[role]["adv"].append(
                     adv_per_problem[p_idx].repeat(n_turn).to(f32)
                 )
                 turn2prob.extend([p_idx] * n_turn)
 
+        # concat → device
         for role in flat:
             for k in ("obs", "h"):
                 flat[role][k] = (torch.cat(flat[role][k]).to(dev, dtype=bf)
-                                 if flat[role][k] else
-                                 torch.empty(0, device=dev, dtype=bf))
-            flat[role]["act"]   = (torch.cat(flat[role]["act"]).to(dev) 
-                                   if flat[role]["act"] else
-                                   torch.empty(0, device=dev, dtype=torch.long))
-            flat[role]["oldlp"] = (torch.cat(flat[role]["oldlp"]).to(dev, dtype=f32)
-                                   if flat[role]["oldlp"] else
-                                   torch.empty(0, device=dev, dtype=f32))
-            flat[role]["adv"]   = (torch.cat(flat[role]["adv"]).to(dev, dtype=f32)
-                                   if flat[role]["adv"] else
-                                   torch.empty(0, device=dev, dtype=f32))
+                                if flat[role][k] else
+                                torch.empty(0, device=dev, dtype=bf))
+            flat[role]["act"]   = torch.cat(flat[role]["act"]).to(dev) if flat[role]["act"] \
+                                else torch.empty(0, device=dev, dtype=torch.long)
+            flat[role]["oldlp"] = torch.cat(flat[role]["oldlp"]).to(dev, dtype=f32) if flat[role]["oldlp"] \
+                                else torch.empty(0, device=dev, dtype=f32)
+            flat[role]["adv"]   = torch.cat(flat[role]["adv"]).to(dev, dtype=f32) if flat[role]["adv"] \
+                                else torch.empty(0, device=dev, dtype=f32)
 
         if all(flat[r]["obs"].numel() == 0 for r in flat):
-            return {}   
+            return {}
 
+        # ────── normalize advantages (global) ──────
         all_adv = torch.cat([flat[r]["adv"] for r in flat])
         if all_adv.numel() > 1:
             std = all_adv.std(unbiased=False)
-            if std > 1e-8:
-                all_adv = (all_adv - all_adv.mean()) / (std + 1e-8)
-            else:
-                all_adv = all_adv - all_adv.mean()
-        else:
-            all_adv = all_adv - all_adv.mean()
-
+            all_adv = (all_adv - all_adv.mean()) / (std + 1e-8) if std > 1e-8 else all_adv - all_adv.mean()
         offset = 0
         for role in flat:
             n = flat[role]["adv"].size(0)
@@ -590,18 +607,18 @@ class SHPPOTrainer:
 
         turn2prob_t = torch.as_tensor(turn2prob, device=dev)
 
-        stats = dict(actor=0., entropy=0., critic=0.,
-                     latent=0., infer=0.)
+        stats = dict(actor=0., entropy=0., critic=0., latent=0., infer=0.)
         nA = nC = nL = nI = 0
 
-        # ========================= 1) ACTOR =========================
+        # =========================================================
+        # 1) ACTOR ( + LoRA)  update
+        # =========================================================
+        self.opt_actor.zero_grad()
         for role, nets in self.role_networks.items():
             if flat[role]["obs"].numel() == 0:
                 continue
-
             actnet, latnet = nets["actor_net"], nets["latent_net"]
-            O, H, A, OLP, ADV = (flat[role][k] for k in
-                                 ("obs", "h", "act", "oldlp", "adv"))
+            O, H, A, OLP, ADV = (flat[role][k] for k in ("obs", "h", "act", "oldlp", "adv"))
 
             M     = O.size(0)
             bsize = max(1, M // cfg.num_minibatches)
@@ -613,121 +630,97 @@ class SHPPOTrainer:
                 h_b = H[mb].detach()
 
                 with torch.no_grad():
-                    z_b, _, _ = latnet(o_b, h_b)  
+                    z_b, _, _ = latnet(o_b, h_b)
 
-                logits_b, *_ = actnet(o_b, h_b, z_b)  
-                dist        = Categorical(logits=logits_b.to(f32))
+                logits_b, *_ = actnet(o_b, h_b, z_b)
+                dist = Categorical(logits=logits_b.to(f32))
 
                 ratio = torch.exp(dist.log_prob(A[mb]) - OLP[mb])
                 surr1 = ratio * ADV[mb]
                 surr2 = torch.clamp(ratio, 1 - cfg.clip_eps, 1 + cfg.clip_eps) * ADV[mb]
-                lossA = -torch.min(surr1, surr2).mean() \
-                        - cfg.ent_coef_actor * dist.entropy().mean()
+                lossA = -torch.min(surr1, surr2).mean() - cfg.ent_coef_actor * dist.entropy().mean()
 
-                self.opt_actor.zero_grad()
                 lossA.backward()
+                stats["actor"] += lossA.item()
+                stats["entropy"] += dist.entropy().mean().item()
                 nA += 1
 
-                stats["actor"]   += lossA.item()
-                stats["entropy"] += dist.entropy().mean().item()
+        torch.nn.utils.clip_grad_norm_(self.opt_actor.param_groups[0]["params"], cfg.max_grad_norm)
+        self.opt_actor.step()
 
-            torch.nn.utils.clip_grad_norm_(actnet.parameters(), cfg.max_grad_norm)
-            self.opt_actor.step()
-
-        # ========================= 2) CRITIC =========================
+        # =========================================================
+        # 2) CRITIC update
+        # =========================================================
+        self.opt_critic.zero_grad()
         B      = R.size(0)
         bsizeT = max(1, B // cfg.num_minibatches)
         permT  = torch.randperm(B, device=dev)
 
         for s in range(0, B, bsizeT):
-            mb     = permT[s:s + bsizeT]
-            # critic 입력도 BF16
-            v_pred, _ = self.critic_net(Sg[mb], Hc0[mb])  
-            target    = R[mb].to(v_pred.dtype)          
-
-            v_pred_flat = v_pred.view(-1)
-            target_flat = target.view(-1)
-
-            diff   = (v_pred_flat.float() - target_flat.float())**2
-            lossV  = diff.mean().to(v_pred.dtype) * cfg.vf_coef
-
-            self.opt_critic.zero_grad()
+            mb      = permT[s:s + bsizeT]
+            v_pred, _ = self.critic_net(Sg[mb], Hc0[mb])
+            target    = R[mb].to(v_pred.dtype)
+            lossV     = F.mse_loss(v_pred.float(), target.float()) * cfg.vf_coef
             lossV.backward()
-            nC += 1
+            stats["critic"] += lossV.item(); nC += 1
 
-        torch.nn.utils.clip_grad_norm_(self.critic_net.parameters(),
-                                       cfg.max_grad_norm)
+        torch.nn.utils.clip_grad_norm_(self.critic_net.parameters(), cfg.max_grad_norm)
         self.opt_critic.step()
-        stats["critic"] += lossV.item()
 
-        # ================ 3) LATENT  &  4) INFERENCE ================
+        # =========================================================
+        # 3) LATENT  &  4) INFERENCE update
+        # =========================================================
         for role, nets in self.role_networks.items():
-            if flat[role]["obs"].numel() == 0:
+            if flat[role]["obs"].numel() == 0: 
                 continue
 
             latnet = nets["latent_net"]
-            O, H = flat[role]["obs"], flat[role]["h"]
-
-            M     = O.size(0)
-            bsize = max(1, M // cfg.num_minibatches)
-            perm  = torch.randperm(M, device=dev)
+            O, H   = flat[role]["obs"], flat[role]["h"]
+            M      = O.size(0)
+            bsize  = max(1, M // cfg.num_minibatches)
+            perm   = torch.randperm(M, device=dev)
 
             for s in range(0, M, bsize):
                 mb   = perm[s:s + bsize]
-                o_b  = O[mb] 
-                h_b  = H[mb] 
-                gidx = turn2prob_t[mb]  
+                o_b  = O[mb]
+                h_b  = H[mb]
+                gidx = turn2prob_t[mb]
 
-                z, mu, sig = latnet(o_b, h_b)  
-                sig32 = sig.float().clamp(min=1e-6)  
-
+                # ---- 3-A) LatentNet grad ----
+                z, mu, sig = latnet(o_b, h_b)
+                sig32 = sig.float().clamp(min=1e-6)
 
                 entropy_lat = (
-                    0.5 * cfg.latent_dim * (1 + math.log(2 * math.pi))
-                    + torch.log(sig32).sum(-1)
-                ).mean()  
-
+                    0.5 * cfg.latent_dim * (1 + math.log(2 * math.pi)) +
+                    torch.log(sig32).sum(-1)
+                ).mean()
                 diversity_lat = cosine_diversity(z.mean(1).unsqueeze(0)).to(f32)
 
-                V_I_lat = self.inference_net(
-                    Sg[gidx].to(bf),  
-                    mu.reshape(len(mb), -1).to(bf),
-                    sig.reshape(len(mb), -1).to(bf)
-                )  
+                with torch.no_grad(): 
+                    V_I_lat = self.inference_net(
+                        Sg[gidx].to(bf),
+                        mu.reshape(len(mb), -1).to(bf),
+                        sig.reshape(len(mb), -1).to(bf)
+                    ).detach()
 
-                
-                lossL_fp32 = (
-                    -cfg.lambda_V_I_guidance_for_latent * V_I_lat.float().mean()
-                    + cfg.lambda_entropy_latent   * entropy_lat
-                    - cfg.lambda_diversity_latent * diversity_lat
-                )
-
-                lossL = lossL_fp32.to(bf)
+                lossL = (
+                    -cfg.lambda_V_I_guidance_for_latent * V_I_lat.float().mean() +
+                    cfg.lambda_entropy_latent * entropy_lat -
+                    cfg.lambda_diversity_latent * diversity_lat
+                ).to(bf)
 
                 self.opt_latent.zero_grad()
                 lossL.backward()
-                nL += 1
-
-                torch.nn.utils.clip_grad_norm_(latnet.parameters(),
-                                               cfg.max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(latnet.parameters(), cfg.max_grad_norm)
                 self.opt_latent.step()
-                stats["latent"] += lossL.item()
+                stats["latent"] += lossL.item(); nL += 1
 
-                
+                # ---- 4-B) InferenceNet grad ----
                 mu_det  = mu.detach().reshape(len(mb), -1).to(bf)
                 sig_det = sig.detach().reshape(len(mb), -1).to(bf)
+                V_I2    = self.inference_net(Sg[gidx].to(bf), mu_det, sig_det)
 
-                V_I2    = self.inference_net(
-                    Sg[gidx].to(bf),  
-                    mu_det,           
-                    sig_det           
-                )  
-
-                target_bf = R[gidx].to(V_I2.dtype)
-
-                loss_inf_f32 = F.mse_loss(V_I2.float(), target_bf.float())
-                loss_inf = (loss_inf_f32 * cfg.lambda_inf_mse).to(V_I2.dtype)
-
+                loss_inf = F.mse_loss(V_I2.float(), R[gidx].float()) * cfg.lambda_inf_mse
                 self.opt_inference.zero_grad()
                 loss_inf.backward()
                 torch.nn.utils.clip_grad_norm_(self.inference_net.parameters(), cfg.max_grad_norm)
@@ -742,6 +735,8 @@ class SHPPOTrainer:
         if nI: stats["infer"]  /= nI
 
         return stats
+
+
 
 
 
