@@ -24,6 +24,7 @@ from shppo_env import SHPPOCodeEnv, CodeContestDataset # Assuming these exist
 
 logger = logging.getLogger(__name__)
 
+#######
 def ortho_init(m: nn.Module, gain: float = 1.0):
     """Orthogonal initialization for linear layers."""
     if isinstance(m, nn.Linear):
@@ -197,7 +198,7 @@ class CriticNet(nn.Module):
         rnn_output, h_crit_next_unsq = self.rnn(projected_state.unsqueeze(1), h_crit_prev.unsqueeze(0))
         value_prediction = self.value_head(rnn_output.squeeze(1)).squeeze(-1)
         return value_prediction, h_crit_next_unsq.squeeze(0)
-
+###
 def build_networks(config: SHPPOConfig, device: torch.device) -> Dict[str, Any]:
     """Builds and initializes all networks, tokenizer, and updates config with dynamic LLM dims."""
     tokenizer = AutoTokenizer.from_pretrained(config.llm_model_name)

@@ -1,521 +1,790 @@
-import numpy as np
-import random
+"""
+env.py - Environment and Dataset Management
+No try-catch, throw errors directly
+"""
+
 import os
-import sys
-from pathlib import Path
 import re
-from tqdm import tqdm, trange
-from multiprocessing import cpu_count
-from typing import Any, Dict, List, Tuple, Optional, Union
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from transformers import BitsAndBytesConfig
-import torch
-from datasets import load_dataset
-import logging
-import concurrent.futures
-from functools import partial
 import csv
+import sys
+import subprocess
+import tempfile
 import multiprocessing
+from pathlib import Path
+from typing import Any, Dict, List, Tuple, Optional, Union
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from tqdm import tqdm, trange
+from collections import Counter
 
+import torch
+import numpy as np
+import pandas as pd
+from datasets import load_dataset
+
+import logging
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
 
-def load_qwen_model(model_name: str = "Qwen/Qwen2.5-Coder-32B-Instruct"):
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    tokenizer.padding_side = "left"
-    
-    # Add pad token if missing
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    
-    # Optimized quantization config
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_use_double_quant=True,
-        llm_int8_enable_fp32_cpu_offload=True  # Better memory management
-    )
-    
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        quantization_config=bnb_config,
-        device_map="auto",
-        torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=True,  # Reduce CPU memory usage
-        trust_remote_code=True,
-        attn_implementation="flash_attention_2"  # Use Flash Attention for speed
-    )
-    
-    # Optimize for inference
-    model.eval()
-    if hasattr(model, 'generation_config'):
-        model.generation_config.pad_token_id = tokenizer.pad_token_id
-    
-    print(f"Model {model_name} loaded successfully.")
-    return tokenizer, model
 
 class CodeContestDataset:
+    """CodeContest Dataset Class"""
+    
     def __init__(self, split: str = "train", max_problems: int = -1, max_cases: int = -1):
-        def _is_valid(row):
-            if row is None:
-                return False
-            if row.get('input_file') or row.get('output_file'):
-                return False
-            if row.get('description') is None or not (10 < len(row['description']) < 1500):
-                return False
-            if row.get('name') is None or row.get('private_tests') is None or len(row['private_tests']['input']) == 0:
-                return False
-            if row.get('solutions') is None or 1 not in row['solutions']['language'] or not any(len(sol.strip()) < 500 for sol in row['solutions']['solution']):
-                return False
-            if row.get('time_limit') is None or not (row['time_limit'].get('seconds') or row['time_limit'].get('nanos')):
-                return False
-            if row.get('cf_rating') is None:
-                return False
-            return True
-        
-        if max_problems <= 0: max_problems = int(sys.maxsize)
-        if max_cases <= 0: max_cases = int(sys.maxsize)
+        self.tasks = []
+        self._load_dataset(split, max_problems, max_cases)
+    
+    def _load_dataset(self, split: str, max_problems: int, max_cases: int):
+        """Load dataset"""
         logger.info(f"Loading {split} dataset...")
-        self.tasks: List[Dict[str, Any]] = []
-        ds = load_dataset("deepmind/code_contests", split=split, streaming=False, trust_remote_code=False)
-        ds = ds.filter(lambda row: _is_valid(row))
+        
+        if max_problems <= 0: 
+            max_problems = float('inf')
+        if max_cases <= 0: 
+            max_cases = float('inf')
+        
+        # Load Hugging Face dataset
+        ds = load_dataset("deepmind/code_contests", split=split, streaming=False)
+        filtered_ds = ds.filter(self._is_valid_task)
+        
         count = 0
-        for row in tqdm(ds, desc="Loading tasks", total=ds.num_rows):
+        for row in tqdm(filtered_ds, desc=f"Loading {split} data", 
+                      total=min(len(filtered_ds), max_problems)):
             if count >= max_problems:
                 break
             
-            name, desc = row['name'], row['description']
-            ins, outs = row['private_tests']['input'], row['private_tests']['output']
-            
-            if 'seconds' in row['time_limit']:
-                time_limit = row['time_limit']['seconds']
-            elif 'nanos' in row['time_limit']:
-                time_limit = row['time_limit']['nanos'] / 1e9
-            
-            self.tasks.append({
-                "name": name,
-                "prompt": desc,
-                "difficulty": row['cf_rating'],
-                "tests": list(zip(ins, outs))[:max_cases],
-                "time_limit": time_limit,
-            })
-            count += 1
-        logger.info(f"Loaded {len(self.tasks)} valid tasks")
+            task = self._process_task(row, max_cases)
+            if task:
+                self.tasks.append(task)
+                count += 1
         
-
+        logger.info(f"Loaded {len(self.tasks)} valid tasks")
+    
+    def _is_valid_task(self, row) -> bool:
+        """Task validation"""
+        # Check basic fields
+        if not all(key in row for key in ['description', 'name', 'private_tests']):
+            return False
+        
+        # Exclude file I/O tasks
+        if row.get('input_file') or row.get('output_file'):
+            return False
+        
+        # Check description length
+        desc = row.get('description', '')
+        if not isinstance(desc, str) or not (50 < len(desc) < 2000):
+            return False
+        
+        # Check test cases
+        private_tests = row.get('private_tests', {})
+        if not private_tests.get('input') or not private_tests.get('output'):
+            return False
+        
+        # Check test case count
+        inputs = private_tests['input']
+        outputs = private_tests['output']
+        if len(inputs) != len(outputs) or len(inputs) == 0:
+            return False
+        
+        return True
+    
+    def _process_task(self, row, max_cases: int) -> Optional[Dict[str, Any]]:
+        """Process task data"""
+        # Handle time limit
+        time_limit = 2.0  # default
+        if row.get('time_limit'):
+            if isinstance(row['time_limit'], dict):
+                if 'seconds' in row['time_limit']:
+                    time_limit = float(row['time_limit']['seconds'])
+                elif 'nanos' in row['time_limit']:
+                    time_limit = float(row['time_limit']['nanos']) / 1e9
+            elif isinstance(row['time_limit'], (int, float)):
+                time_limit = float(row['time_limit'])
+        
+        # Limit time to reasonable range
+        time_limit = max(1.0, min(time_limit, 10.0))
+        
+        # Process test cases
+        inputs = row['private_tests']['input']
+        outputs = row['private_tests']['output']
+        
+        test_count = min(len(inputs), max_cases)
+        tests = []
+        
+        for i in range(test_count):
+            inp = str(inputs[i]).strip()
+            out = str(outputs[i]).strip()
+            if inp or out:  # exclude empty test cases
+                tests.append((inp, out))
+        
+        if not tests:
+            return None
+        
+        # Handle difficulty
+        difficulty = row.get('cf_rating', 1000)
+        if not isinstance(difficulty, (int, float)):
+            difficulty = 1000
+        
+        return {
+            "name": str(row['name']).strip(),
+            "prompt": str(row['description']).strip(),
+            "difficulty": int(difficulty),
+            "tests": tests,
+            "time_limit": time_limit,
+        }
+    
     def get_all_tasks(self) -> List[Dict[str, Any]]:
         return self.tasks
 
-def extract_solve_function(response: str, code_pattern: re.Pattern) -> callable:
-    """Extract solve function from model response"""
-    code_match = code_pattern.search(response)
-    code_str = code_match.group(1).strip() if code_match else response.strip()
+
+class SafeCodeExecutor:
+    """Safe Code Execution Engine"""
     
-    # Quick validation before exec
-    if not code_str or 'def solve' not in code_str:
-        return None
-        
-    namespace = {}
-    try:
-        exec(code_str, namespace)
-        return namespace.get("solve", None)
-    except Exception as e:
-        logger.debug(f"Failed to extract solve function: {e}")
-        return None
-
-def evaluate_single_problem(problem_data: Tuple[int, Dict[str, Any], str, str],
-                            code_pattern: re.Pattern) -> List[Dict[str, Any]]:
-    """
-    Evaluate a single problem – enforces per-test timeouts via `signal.alarm`
-    (no ThreadPoolExecutor), avoiding leftover threads at exit.
-    """
-    import signal
-    import logging
-
-    logger = logging.getLogger("eval")
-
-    idx, task, response, filepath = problem_data
-    tests        = task["tests"]         # note: changed from 'tests_public' to 'tests'
-    description  = task.get("prompt", "")
-    problem_name = task.get("name", f"task_{idx}")
-    timeout: float = task["time_limit"]  # may be float seconds
-
-    # For human-readable timeout in logs:
-    t_int = int(timeout)
-    h, m, s = t_int // 3600, (t_int % 3600) // 60, t_int % 60
-    print(
-        f"Evaluating {problem_name} - {description[:50]}..."
-        f" (Timeout: {h}h {m}m {s}s, N tests: {len(tests)})"
-    )
-
-    # signal handler raises TimeoutError in this process if alarm triggers
-    def _timeout_handler(signum, frame):
-        raise TimeoutError()
-
-    solve_fn = extract_solve_function(response, code_pattern)
-    if solve_fn is None:
-        # If extraction failed, return a failed record for each test
-        return [
-            {
-                "problem_name": problem_name,
-                "description": description,
-                "test_case": inp,
-                "expected_output": expected,
-                "generated_output": None,
-                "execution_error": "Failed to extract solve function",
-                "difficulty": task.get("difficulty", "unknown"),
-                "passed": False,
-            }
-            for inp, expected in tests
+    @staticmethod
+    def extract_solve_function(response: str) -> Optional[str]:
+        """Extract Python code from response"""
+        # Python code block patterns
+        patterns = [
+            r'```python\s*(.*?)\s*```',
+            r'```\s*(def solve.*?)\s*```',
+            r'(def solve.*?)(?=\n\n|\nclass|\ndef(?!\s+solve)|\n#|\Z)',
         ]
+        
+        for pattern in patterns:
+            matches = re.findall(pattern, response, re.DOTALL | re.IGNORECASE)
+            if matches:
+                code = matches[0].strip()
+                if 'def solve' in code:
+                    return code
+        
+        # If no code block, search in entire response
+        if 'def solve' in response:
+            return response.strip()
+        
+        return None
+    
+    @staticmethod
+    def execute_code_safely(code: str, input_data: str, timeout: float) -> Tuple[bool, str, str]:
+        """Safe code execution via multiprocessing"""
+        def run_code(code_str, input_str, result_queue):
+            """Execute code in separate process"""
+            # Write code to temporary file
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+                full_code = f"""
+import sys
 
-    results: List[Dict[str, Any]] = []
-    for idx_test, (inp, expected) in enumerate(tests):
-        exec_error, passed, gen_out = "", False, None
+# Original code
+{code_str}
 
-        # Register the timeout handler and arm the alarm
-        original_handler = signal.signal(signal.SIGALRM, _timeout_handler)
-        signal.alarm(int(timeout))
+# Input data
+input_data = '''{input_str}'''
 
-        try:
-            gen_out = solve_fn(inp)
-            # Cancel any pending alarm
-            signal.alarm(0)
-            if str(gen_out).strip() == str(expected).strip():
-                passed = True
-        except TimeoutError:
-            exec_error = f"Timed-out after {timeout:.2f}s"
-            logger.warning(f"[{problem_name}][{idx_test}] {exec_error}")
-        except Exception as e:
-            exec_error = str(e)
-        finally:
-            # Ensure alarm is off and restore previous handler
-            signal.alarm(0)
-            signal.signal(signal.SIGALRM, original_handler)
+# Check if solve function exists
+if 'solve' not in globals():
+    print("ERROR: solve function not found")
+    sys.exit(1)
 
-        results.append(
-            {
-                "problem_name": problem_name,
-                "description": description,
-                "test_case": inp,
-                "expected_output": expected,
-                "generated_output": gen_out,
-                "execution_error": exec_error,
-                "difficulty": task.get("difficulty", "unknown"),
-                "passed": passed,
-            }
-        )
+# Execute function
+result = solve(input_data)
 
-    return results
+# Output result
+if result is not None:
+    print(str(result))
+else:
+    print("ERROR: solve function returned None")
+    sys.exit(1)
+"""
+                f.write(full_code)
+                temp_file = f.name
+            
+            # Execute via subprocess
+            process = subprocess.Popen(
+                [sys.executable, temp_file],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=timeout
+            )
+            
+            stdout, stderr = process.communicate(timeout=timeout)
+            
+            # Delete temporary file
+            os.unlink(temp_file)
+            
+            # Analyze result
+            if process.returncode == 0:
+                output = stdout.strip()
+                if output.startswith("ERROR:"):
+                    result_queue.put(('error', '', output))
+                else:
+                    result_queue.put(('success', output, ''))
+            else:
+                error_output = stdout.strip() if stdout.strip() else stderr.strip()
+                result_queue.put(('error', '', error_output))
+        
+        # Multiprocessing execution
+        result_queue = multiprocessing.Queue()
+        process = multiprocessing.Process(target=run_code, args=(code, input_data, result_queue))
+        process.start()
+        process.join(timeout + 2)
+        
+        # Force terminate if process still alive
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=1)
+            if process.is_alive():
+                process.kill()
+                process.join()
+            return False, '', f'Process timeout after {timeout}s'
+        
+        # Get result
+        if not result_queue.empty():
+            status, output, error = result_queue.get_nowait()
+            if status == 'success':
+                return True, output, ''
+            else:
+                return False, '', error
+        else:
+            return False, '', 'No result from process'
+
 
 class CodeTester:
-    def __init__(self, dataset, batch_size: int = 32, max_workers: int = 8, log_file: Optional[str] = None):
+    """Code Testing Environment"""
+    
+    def __init__(self, dataset, batch_size: int = 8, max_workers: int = 2, log_file: Optional[str] = None):
         self.tasks = dataset.get_all_tasks()
-        self.total = len(self.tasks)
         self.batch_size = batch_size
-        self.max_workers = max_workers  # Number of parallel evaluation workers
+        self.max_workers = max_workers
+        self.log_file = log_file or "execution_log.csv"
         self.sample_dir = Path("generated_samples")
-        if log_file:
-            self.log_file = Path(log_file)
-        else:
-            self.log_file = "execution_log.csv"
-        # Pre-compile regex for better performance
-        self.code_pattern = re.compile(r'```python(.*?)```', re.DOTALL)
+        self.sample_dir.mkdir(exist_ok=True)
     
-    def extract_solve_function(self, response: str) -> callable:
-        """Extract solve function from model response - instance method"""
-        return extract_solve_function(response, self.code_pattern)
-    
-    def ask_qwen_batch_optimized(
-        self, tokenizer, model, prompts: List[str],
-        return_hidden: bool = False, return_logprobs: bool = False, num_return_sequences: int = 1
-    ) -> Union[List[str], Tuple]:
-        """Highly optimized batch generation with optional hidden state and log prob return"""
-        responses = []
+    def generate_solutions(self, tokenizer, model, prompts: List[str], **kwargs) -> Union[List[str], Tuple]:
+        """Generate solutions"""
+        return_hidden = kwargs.get('return_hidden', False)
+        return_logprobs = kwargs.get('return_logprobs', False)
+        num_return_sequences = kwargs.get('num_return_seqs', 1)
+        
+        all_responses = []
         all_hidden_states = []
-        all_generated_tokens = []
+        all_tokens = []
         all_log_probs = []
-
-        # Pre-build all chat templates (vectorized approach)
-        all_texts = []
-        user_msg_template = (
-            "Write a Python function `solve(input_str: str) -> str` that solves the following problem. "
-            "Your code should read from the input string and return the correct output string.\n\n"
-            "### Problem Description\n{}\n"
-            "Only provide the code (no explanations), wrapped in ```python``` markers."
+        
+        # Prompt template
+        template = (
+            "Write a Python function to solve the following programming problem.\n\n"
+            "### Problem Description\n{}\n\n"
+            "Function signature: def solve(input_str: str) -> str\n"
+            "- input_str: input data (string)\n"
+            "- return: answer (string)\n\n"
+            "Only provide Python code wrapped in ```python``` markers."
         )
-
-        for prompt in prompts:
-            user_msg = user_msg_template.format(prompt)
-            msg_sequence = [
-                {"role": "system", "content": "You are Qwen, a helpful coding assistant."},
-                {"role": "user", "content": user_msg}
-            ]
-            text = tokenizer.apply_chat_template(msg_sequence, tokenize=False, add_generation_prompt=True)
-            all_texts.append(text)
-
-        # Process in optimized batches
-        for i in trange(0, len(all_texts), self.batch_size, desc="Generating", leave=True):
-            chunk_texts = all_texts[i:i+self.batch_size]
-            # Efficient tokenization with proper padding
+        
+        # Batch processing
+        for i in trange(0, len(prompts), self.batch_size, desc="Generating solutions"):
+            batch_prompts = prompts[i:i + self.batch_size]
+            
+            # Apply chat template
+            formatted_prompts = []
+            for prompt in batch_prompts:
+                messages = [
+                    {"role": "system", "content": "You are an expert programmer."},
+                    {"role": "user", "content": template.format(prompt)}
+                ]
+                formatted = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                formatted_prompts.append(formatted)
+            
+            # Tokenization
             inputs = tokenizer(
-                chunk_texts,
+                formatted_prompts,
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
-                max_length=2048  # Limit input length for faster processing
+                max_length=2048
             ).to(model.device)
-
-            # --- Unified block for hidden/logprobs/generation ---
+            
             with torch.no_grad():
-                # Compute hidden states if requested
+                # Extract hidden states
                 if return_hidden:
-                    forward_outputs = model(**inputs, output_hidden_states=True, return_dict=True)
-                    hidden_layer = forward_outputs.hidden_states[-1]
+                    outputs = model(**inputs, output_hidden_states=True, return_dict=True)
+                    hidden_states = outputs.hidden_states[-1]
                     seq_lens = inputs.attention_mask.sum(dim=1) - 1
-                    batch_hidden = hidden_layer[torch.arange(hidden_layer.size(0)), seq_lens, :]
+                    batch_hidden = hidden_states[torch.arange(hidden_states.size(0)), seq_lens, :]
                     all_hidden_states.append(batch_hidden.cpu())
-                # Generate all candidate sequences
-                outputs = model.generate(
+                
+                # Text generation
+                gen_outputs = model.generate(
                     **inputs,
                     max_new_tokens=512,
-                    min_new_tokens=10,
+                    min_new_tokens=20,
                     do_sample=True,
+                    temperature=0.7,
+                    top_p=0.9,
                     num_return_sequences=num_return_sequences,
                     pad_token_id=tokenizer.pad_token_id,
                     eos_token_id=tokenizer.eos_token_id,
-                    use_cache=True,
                     return_dict_in_generate=True,
                     output_scores=return_logprobs,
+                    use_cache=True
                 )
-            # Slice off the prompt tokens
-            gen_ids = outputs.sequences[:, inputs.input_ids.shape[1]:]
-            decoded_all = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
-            all_generated_tokens.append(gen_ids.cpu())
-            # Compute log probabilities if requested
-            if return_logprobs and outputs.scores:
-                batch_log_probs = []
-                for t_idx, token_seq in enumerate(gen_ids):
-                    seq_log_probs = []
-                    for tok_pos, tok_id in enumerate(token_seq):
-                        if tok_pos < len(outputs.scores):
-                            logits = outputs.scores[tok_pos][t_idx]
-                            logp = torch.nn.functional.log_softmax(logits, dim=-1)[tok_id]
-                            seq_log_probs.append(logp.cpu())
-                    if seq_log_probs:
-                        batch_log_probs.append(torch.stack(seq_log_probs).sum())
+                
+                # Extract generated tokens only
+                prompt_len = inputs.input_ids.shape[1]
+                generated_tokens = gen_outputs.sequences[:, prompt_len:]
+                
+                # Decode
+                batch_responses = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
+                all_responses.extend(batch_responses)
+                
+                # Calculate log probabilities
+                if return_logprobs:
+                    for seq in generated_tokens:
+                        all_tokens.append(seq.cpu())
+                    
+                    if gen_outputs.scores:
+                        # Simple log probability calculation
+                        for i in range(len(generated_tokens)):
+                            log_prob = torch.tensor(-1.0)  # default value
+                            if gen_outputs.scores and len(gen_outputs.scores) > 0:
+                                first_score = gen_outputs.scores[0][i]
+                                probs = torch.softmax(first_score, dim=-1)
+                                if len(generated_tokens[i]) > 0:
+                                    token_id = generated_tokens[i][0]
+                                    log_prob = torch.log(probs[token_id] + 1e-8)
+                            all_log_probs.append(log_prob)
                     else:
-                        batch_log_probs.append(torch.tensor(0.0))
-                all_log_probs.extend(batch_log_probs)
-            elif return_logprobs:
-                all_log_probs.extend([torch.tensor(0.0) for _ in range(gen_ids.size(0))])
-            # Append all decoded responses (no selection)
-            responses.extend(decoded_all)
-
-            # Clear cache to prevent memory buildup
-            if hasattr(torch.cuda, 'empty_cache'):
+                        all_log_probs.extend([torch.tensor(-1.0) for _ in range(len(generated_tokens))])
+            
+            # Memory cleanup
+            if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-
-        # Prepare return values
-        result = [responses]
-        if return_hidden:
-            combined_hidden = torch.cat(all_hidden_states, dim=0) if all_hidden_states else torch.empty(0)
-            result.append(combined_hidden)
+        
+        # Construct return value
+        result = [all_responses]
+        
+        if return_hidden and all_hidden_states:
+            result.append(torch.cat(all_hidden_states, dim=0))
+        elif return_hidden:
+            result.append(torch.empty(0))
+        
         if return_logprobs:
-            combined_tokens = torch.cat(all_generated_tokens, dim=0) if all_generated_tokens else torch.empty(0)
-            combined_log_probs = torch.stack(all_log_probs) if all_log_probs else torch.empty(0)
-            result.extend([combined_tokens, combined_log_probs])
+            if all_tokens:
+                # Token padding
+                max_len = max(t.size(0) for t in all_tokens) if all_tokens else 1
+                padded_tokens = []
+                for token_seq in all_tokens:
+                    if token_seq.size(0) < max_len:
+                        padding = torch.full((max_len - token_seq.size(0),), tokenizer.pad_token_id)
+                        padded_seq = torch.cat([token_seq, padding])
+                    else:
+                        padded_seq = token_seq[:max_len]
+                    padded_tokens.append(padded_seq)
+                result.append(torch.stack(padded_tokens))
+            else:
+                result.append(torch.empty(0))
+            
+            if all_log_probs:
+                result.append(torch.stack(all_log_probs))
+            else:
+                result.append(torch.empty(0))
+        
         return tuple(result) if len(result) > 1 else result[0]
     
-    def save_generated_code(self, task_name: str, response: str, idx: int):
-        """Save generated code to sample directory"""
-        self.sample_dir.mkdir(exist_ok=True)
+    def evaluate_solution(self, task_and_solution: Tuple[Dict[str, Any], str]) -> List[Dict[str, Any]]:
+        """Evaluate single solution with detailed error classification"""
+        task, solution = task_and_solution
+        problem_name = task["name"]
+        tests = task["tests"]
+        timeout = task["time_limit"]
+        difficulty = task.get("difficulty", 1000)  # Get difficulty for logging
         
-        # Clean task name for filename (remove invalid characters)
-        clean_name = re.sub(r'[<>:"/\\|?*]', '_', task_name.strip())
-        if not clean_name:
-            clean_name = f"task_{idx}"
+        # Extract code
+        code = SafeCodeExecutor.extract_solve_function(solution)
+        if not code:
+            return [{
+                "problem_name": problem_name,
+                "test_case": inp,
+                "expected_output": expected,
+                "generated_output": None,
+                "execution_error": "solve function not found",
+                "error_type": "CODE_EXTRACTION_ERROR",
+                "difficulty": difficulty,
+                "passed": False,
+            } for inp, expected in tests]
         
-        filename = f"{clean_name}.py"
-        filepath = self.sample_dir / filename
+        results = []
+        for test_idx, (inp, expected) in enumerate(tests):
+            # Execute code
+            success, output, error = SafeCodeExecutor.execute_code_safely(code, inp, timeout)
+            
+            # Initialize result variables
+            passed = False
+            generated_output = None
+            execution_error = ""
+            error_type = "NONE"
+            
+            if success:
+                # Code executed successfully
+                if output is not None and output.strip():
+                    generated_output = str(output).strip()
+                    expected_output = str(expected).strip()
+                    passed = generated_output == expected_output
+                    
+                    if not passed:
+                        error_type = "WRONG_ANSWER"
+                        execution_error = f"WRONG_ANSWER: Expected '{expected_output}', got '{generated_output}'"
+                else:
+                    # Success but no output
+                    generated_output = ""
+                    error_type = "NO_OUTPUT"
+                    execution_error = "NO_OUTPUT: Function executed but produced no output"
+            else:
+                # Code execution failed
+                generated_output = None
+                
+                # Classify error types
+                error_lower = error.lower()
+                
+                if "timeout" in error_lower or "time" in error_lower:
+                    error_type = "TIMEOUT"
+                    execution_error = f"TIMEOUT: {error}"
+                elif "no output produced" in error_lower:
+                    error_type = "NO_OUTPUT"
+                    execution_error = f"NO_OUTPUT: {error}"
+                elif "solve function not found" in error_lower:
+                    error_type = "FUNCTION_NOT_FOUND"
+                    execution_error = f"FUNCTION_NOT_FOUND: {error}"
+                elif "syntaxerror" in error_lower or "syntax" in error_lower:
+                    error_type = "SYNTAX_ERROR"
+                    execution_error = f"SYNTAX_ERROR: {error}"
+                elif "nameerror" in error_lower:
+                    error_type = "NAME_ERROR"
+                    execution_error = f"NAME_ERROR: {error}"
+                elif "typeerror" in error_lower:
+                    error_type = "TYPE_ERROR"
+                    execution_error = f"TYPE_ERROR: {error}"
+                elif "valueerror" in error_lower:
+                    error_type = "VALUE_ERROR"
+                    execution_error = f"VALUE_ERROR: {error}"
+                elif "indexerror" in error_lower:
+                    error_type = "INDEX_ERROR"
+                    execution_error = f"INDEX_ERROR: {error}"
+                elif "keyerror" in error_lower:
+                    error_type = "KEY_ERROR"
+                    execution_error = f"KEY_ERROR: {error}"
+                elif "attributeerror" in error_lower:
+                    error_type = "ATTRIBUTE_ERROR"
+                    execution_error = f"ATTRIBUTE_ERROR: {error}"
+                elif "zerodivisionerror" in error_lower:
+                    error_type = "ZERO_DIVISION_ERROR"
+                    execution_error = f"ZERO_DIVISION_ERROR: {error}"
+                elif "recursionerror" in error_lower or "maximum recursion" in error_lower:
+                    error_type = "RECURSION_ERROR"
+                    execution_error = f"RECURSION_ERROR: {error}"
+                elif "memoryerror" in error_lower:
+                    error_type = "MEMORY_ERROR"
+                    execution_error = f"MEMORY_ERROR: {error}"
+                elif "importerror" in error_lower or "modulenotfounderror" in error_lower:
+                    error_type = "IMPORT_ERROR"
+                    execution_error = f"IMPORT_ERROR: {error}"
+                elif "indentationerror" in error_lower:
+                    error_type = "INDENTATION_ERROR"
+                    execution_error = f"INDENTATION_ERROR: {error}"
+                elif "runtimeerror" in error_lower:
+                    error_type = "RUNTIME_ERROR"
+                    execution_error = f"RUNTIME_ERROR: {error}"
+                elif "process timeout" in error_lower:
+                    error_type = "PROCESS_TIMEOUT"
+                    execution_error = f"PROCESS_TIMEOUT: {error}"
+                elif "no result" in error_lower:
+                    error_type = "NO_RESULT"
+                    execution_error = f"NO_RESULT: {error}"
+                else:
+                    error_type = "UNKNOWN_ERROR"
+                    execution_error = f"UNKNOWN_ERROR: {error}"
+            
+            results.append({
+                "problem_name": problem_name,
+                "test_case": inp,
+                "expected_output": expected,
+                "generated_output": generated_output,
+                "execution_error": execution_error,
+                "error_type": error_type,
+                "difficulty": difficulty,
+                "passed": passed,
+            })
         
-        # Handle duplicate filenames
-        counter = 1
-        while filepath.exists():
-            filename = f"{clean_name}_{counter}.py"
-            filepath = self.sample_dir / filename
-            counter += 1
-        ## remove ```python``` markers from response
-        response = re.sub(r'```python', '', response)
-        response = re.sub(r'```', '', response).strip()
-        try:
-            with open(filepath, 'w', encoding='utf-8') as f:
-                f.write(f"# Task: {task_name}\n")
-                f.write(f"# Generated solution\n\n")
-                f.write(response)
-            logger.debug(f"Saved code to {filepath}")
-        except Exception as e:
-            logger.warning(f"Failed to save code for task {task_name}: {e}")
-        return filepath
-
-    def run(
-        self,
-        tokenizer,
-        model,
-        return_hidden: bool = False,
-        return_logprobs: bool = False,
-        log: bool = True,
-        num_return_seqs: int = 1,
-    ) -> Union[float, Tuple]:
-        """
-        Optimized main evaluation loop with signal-based per-test timeouts and
-        non-blocking ProcessPoolExecutor shutdown (using spawn).
-        """
-        import multiprocessing
-
-        # 1) Extract prompts
+        return results
+    
+    def run(self, tokenizer, model, return_hidden: bool = False, 
+            return_logprobs: bool = False, log: bool = True, 
+            num_return_seqs: int = 1) -> Union[float, Tuple]:
+        """Main execution function"""
+        
+        print(f"CodeTester running: {len(self.tasks)} problems")
+        
+        # Extract prompts
         prompts = [task["prompt"] for task in self.tasks]
-
-        # 2) Generate solutions in batches
-        print("Generating solutions...")
-        generation_result = self.ask_qwen_batch_optimized(
-            tokenizer,
-            model,
-            prompts,
+        
+        # Generate solutions
+        print("Generating AI solutions...")
+        generation_result = self.generate_solutions(
+            tokenizer, model, prompts,
             return_hidden=return_hidden,
             return_logprobs=return_logprobs,
-            num_return_sequences=num_return_seqs,
+            num_return_seqs=num_return_seqs
         )
-
-        # 3) Unpack generation result
+        
+        # Unpack results
         if return_hidden and return_logprobs:
-            responses, hidden_states, generated_tokens, log_probs = generation_result
-            print(
-                f"Generated {len(responses)} responses "
-                f"with hidden states shape: {hidden_states.shape}"
-            )
-            print(
-                f"Generated tokens shape: {generated_tokens.shape}, "
-                f"Log probs shape: {log_probs.shape}"
-            )
+            solutions, hidden_states, tokens, log_probs = generation_result
         elif return_hidden:
-            responses, hidden_states = generation_result
-            print(
-                f"Generated {len(responses)} responses "
-                f"with hidden states shape: {hidden_states.shape}"
-            )
-            generated_tokens, log_probs = None, None
+            solutions, hidden_states = generation_result
+            tokens, log_probs = None, None
         elif return_logprobs:
-            responses, generated_tokens, log_probs = generation_result
-            print(f"Generated {len(responses)} responses with tokens and log probs")
+            solutions, tokens, log_probs = generation_result
             hidden_states = None
         else:
-            responses = generation_result
-            hidden_states, generated_tokens, log_probs = None, None, None
-
-        # 4) Save each generated code snippet to disk
-        print("Saving generated solutions...")
-        filepaths: List[str] = []
-        for idx, (task, response) in enumerate(zip(self.tasks, responses)):
-            task_name = task.get("name", f"task_{idx}")
-            filepath = self.save_generated_code(task_name, response, idx)
-            filepaths.append(str(filepath))
-
-        # 5) Build argument tuples for parallel evaluation
-        problem_data = [
-            (idx, task, response, filepaths[idx])
-            for idx, (task, response) in enumerate(zip(self.tasks, responses))
-        ]
-
-        all_results: List[Dict[str, Any]] = []
-
-        # 6) Use a spawn-based ProcessPoolExecutor to avoid fork/threads deadlocks
-        ctx = multiprocessing.get_context("spawn")
-        executor = concurrent.futures.ProcessPoolExecutor(
-            max_workers=self.max_workers, mp_context=ctx
-        )
-        try:
+            solutions = generation_result
+            hidden_states, tokens, log_probs = None, None, None
+        
+        print(f"Generated {len(solutions)} solutions")
+        
+        # Save solutions
+        for i, (task, solution) in enumerate(zip(self.tasks, solutions)):
+            self._save_solution(task["name"], solution, i)
+        
+        # Execute and evaluate code
+        print("Executing and evaluating solutions...")
+        all_results = []
+        
+        # Create task-solution pairs
+        task_solution_pairs = list(zip(self.tasks, solutions))
+        
+        # Parallel execution
+        with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
             futures = [
-                executor.submit(evaluate_single_problem, pd, self.code_pattern)
-                for pd in problem_data
+                executor.submit(self.evaluate_solution, pair)
+                for pair in task_solution_pairs
             ]
-
-            for fut in tqdm(
-                concurrent.futures.as_completed(futures),
-                total=len(futures),
-                desc="Evaluating problems",
-                leave=True,
-            ):
-                try:
-                    all_results.extend(fut.result())
-                except Exception as e:
-                    logger.warning(f"Problem evaluation failed: {e}")
-        finally:
-            # Non-blocking shutdown: if any worker process is still alive, this
-            # lets the main script proceed without hanging.
-            executor.shutdown(wait=False, cancel_futures=True)
-
-        print("Evaluation completed. Processing results...")
-
-        # 7) Optionally write CSV log
-        if log:
-            print("Saving execution results to CSV file...")
-            import csv
-
-            with open(self.log_file, "w", newline="", encoding="utf-8") as csvfile:
-                fieldnames = [
-                    "problem_name",
-                    "description",
-                    "test_case",
-                    "difficulty",
-                    "expected_output",
-                    "generated_output",
-                    "execution_error",
-                    "passed",
-                ]
-                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                writer.writeheader()
-                for record in all_results:
-                    writer.writerow(record)
-
-        # 8) Print summary stats
-        pass_counts = sum(1 for r in all_results if r["passed"])
+            
+            for future in tqdm(as_completed(futures, timeout=300), 
+                             total=len(futures), desc="Code execution and evaluation"):
+                results = future.result(timeout=60)  # max 1 minute per problem
+                all_results.extend(results)
+        
+        # Save results
+        if log and all_results:
+            self._save_results(all_results)
+        
+        # Calculate statistics
         total_tests = len(all_results)
-        avg_rate = (pass_counts / total_tests * 100) if total_tests > 0 else 0.0
-        print(f"Average pass rate across tasks: {avg_rate:.2f}%")
-
-        err_count = sum(1 for r in all_results if r["execution_error"])
-        err_rate = (err_count / total_tests * 100) if total_tests > 0 else 0.0
-        print(f"Execution error rate: {err_rate:.2f}% ({err_count}/{total_tests})")
-
-        # 9) Return based on requested flags
+        passed_tests = sum(1 for r in all_results if r["passed"])
+        error_tests = sum(1 for r in all_results if r["execution_error"])
+        
+        pass_rate = (passed_tests / total_tests * 100) if total_tests > 0 else 0.0
+        error_rate = (error_tests / total_tests * 100) if total_tests > 0 else 0.0
+        
+        print(f"Evaluation complete:")
+        print(f"  - Total tests: {total_tests}")
+        print(f"  - Passed: {passed_tests} ({pass_rate:.1f}%)")
+        print(f"  - Execution errors: {error_tests} ({error_rate:.1f}%)")
+        
+        # Return values
         if return_hidden and return_logprobs:
-            return avg_rate, responses, hidden_states, generated_tokens, log_probs
+            return pass_rate, solutions, hidden_states, tokens, log_probs
         elif return_hidden:
-            return avg_rate, responses, hidden_states
+            return pass_rate, solutions, hidden_states
         elif return_logprobs:
-            return avg_rate, responses, generated_tokens, log_probs
+            return pass_rate, solutions, tokens, log_probs
         else:
-            return avg_rate
+            return pass_rate
+    
+    def _save_solution(self, task_name: str, solution: str, idx: int):
+        """Save solution to file"""
+        # Generate safe filename
+        safe_name = re.sub(r'[^\w\-_\.]', '_', task_name.strip())
+        if not safe_name:
+            safe_name = f"task_{idx}"
+        
+        filepath = self.sample_dir / f"{safe_name}.py"
+        counter = 1
+        while filepath.exists():
+            filepath = self.sample_dir / f"{safe_name}_{counter}.py"
+            counter += 1
+        
+        # Clean code
+        clean_solution = solution
+        clean_solution = re.sub(r'```python\s*', '', clean_solution)
+        clean_solution = re.sub(r'```\s*', '', clean_solution)
+        clean_solution = clean_solution.strip()
+        
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(f"# Task: {task_name}\n")
+            f.write(f"# Generated solution\n\n")
+            f.write(clean_solution)
+            f.write("\n")
+    
+    def _save_results(self, results: List[Dict[str, Any]]):
+        """Save results to CSV"""
+        fieldnames = [
+            "problem_name", "test_case", "expected_output",
+            "generated_output", "execution_error", "error_type", "difficulty", "passed"
+        ]
+        
+        with open(self.log_file, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            
+            for result in results:
+                # Select necessary fields and handle None values
+                row = {}
+                for field in fieldnames:
+                    value = result.get(field, "")
+                    if value is None:
+                        value = ""
+                    # Truncate large text
+                    if isinstance(value, str) and len(value) > 1000:
+                        value = value[:1000] + "..."
+                    row[field] = value
+                writer.writerow(row)
+        
+        # Print error statistics
+        self._print_error_statistics(results)
+        print(f"Results saved to {self.log_file}")
+    
+    def _print_error_statistics(self, results: List[Dict[str, Any]]):
+        """Print error statistics"""
+        # Error type statistics
+        error_types = [r.get('error_type', 'NONE') for r in results]
+        error_counts = Counter(error_types)
+        
+        total_tests = len(results)
+        passed_tests = sum(1 for r in results if r.get('passed', False))
+        
+        print(f"\n=== Execution Result Statistics ===")
+        print(f"Total tests: {total_tests}")
+        print(f"Passed: {passed_tests} ({passed_tests/total_tests*100:.1f}%)")
+        print(f"Failed: {total_tests - passed_tests} ({(total_tests-passed_tests)/total_tests*100:.1f}%)")
+        
+        print(f"\n=== Error Type Statistics ===")
+        for error_type, count in error_counts.most_common():
+            percentage = count / total_tests * 100
+            print(f"{error_type}: {count} ({percentage:.1f}%)")
+        
+        # Descriptions for common errors
+        common_errors = {
+            'WRONG_ANSWER': 'Wrong answer (logic error)',
+            'NO_OUTPUT': 'No output produced',
+            'TIMEOUT': 'Execution timeout',
+            'SYNTAX_ERROR': 'Syntax error',
+            'NAME_ERROR': 'Undefined variable/function',
+            'TYPE_ERROR': 'Type-related error',
+            'VALUE_ERROR': 'Value-related error',
+            'INDEX_ERROR': 'Index out of range',
+            'RECURSION_ERROR': 'Recursion limit exceeded',
+            'RUNTIME_ERROR': 'Runtime error'
+        }
+        
+        print(f"\n=== Main Error Descriptions ===")
+        for error_type, count in error_counts.most_common(5):
+            if error_type in common_errors and count > 0:
+                print(f"{error_type}: {common_errors[error_type]}")
 
-def main():
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"  # Disable parallel tokenization to avoid issues
-    # Enable optimizations
-    seed = 42
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    torch.set_grad_enabled(False)
+
+def test_code_execution():
+    """Test code execution with various scenarios"""
+    print("Testing code execution with multiple scenarios...")
     
-    dataset = CodeContestDataset(split="test")
-    tokenizer, model = load_qwen_model(model_name="Qwen/Qwen2.5-Coder-32B-Instruct")
-    tester = CodeTester(dataset=dataset, batch_size=200, max_workers=cpu_count() // 2)
+    test_cases = [
+        {
+            "name": "Simple Addition",
+            "code": """
+def solve(input_str):
+    lines = input_str.strip().split('\\n')
+    a, b = map(int, lines[0].split())
+    return str(a + b)
+""",
+            "input": "3 5",
+            "expected": "8"
+        },
+        {
+            "name": "No Output (None return)",
+            "code": """
+def solve(input_str):
+    a, b = map(int, input_str.strip().split())
+    result = a + b
+    return None  # This should fail
+""",
+            "input": "3 5",
+            "expected": "8"
+        },
+        {
+            "name": "Empty String Output",
+            "code": """
+def solve(input_str):
+    return ""  # This should fail
+""",
+            "input": "3 5",
+            "expected": "8"
+        },
+        {
+            "name": "Syntax Error",
+            "code": """
+def solve(input_str):
+    a, b = map(int, input_str.strip().split())
+    return str(a + b  # Missing closing parenthesis
+""",
+            "input": "3 5",
+            "expected": "8"
+        },
+        {
+            "name": "Runtime Error",
+            "code": """
+def solve(input_str):
+    a, b = map(int, input_str.strip().split())
+    return str(a / 0)  # Division by zero
+""",
+            "input": "3 5",
+            "expected": "8"
+        }
+    ]
     
-    tester.run(tokenizer, model, log=False)
+    print(f"Running {len(test_cases)} test cases...")
+    results = []
+    
+    for i, test_case in enumerate(test_cases, 1):
+        print(f"\nTest {i}: {test_case['name']}")
+        
+        success, output, error = SafeCodeExecutor.execute_code_safely(
+            test_case['code'], 
+            test_case['input'], 
+            5.0
+        )
+        
+        expected_success = test_case['name'] == "Simple Addition"
+        
+        print(f"  Success: {success}")
+        print(f"  Output: '{output}'")
+        print(f"  Error: '{error}'")
+        print(f"  Expected to succeed: {expected_success}")
+        
+        if expected_success:
+            test_passed = success and output.strip() == test_case['expected']
+        else:
+            test_passed = not success and error  # Should fail with an error message
+        
+        print(f"  Test result: {'PASS' if test_passed else 'FAIL'}")
+        results.append(test_passed)
+    
+    all_passed = all(results)
+    print(f"\nOverall test result: {'ALL TESTS PASSED' if all_passed else 'SOME TESTS FAILED'}")
+    print(f"Passed: {sum(results)}/{len(results)}")
+    
+    return all_passed
+
 
 if __name__ == "__main__":
-    main()
+    # Test code execution
+    if test_code_execution():
+        print("Code execution test passed!")
+    else:
+        print("Code execution test failed!")

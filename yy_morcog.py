@@ -101,7 +101,7 @@ ACTION_TEMPLATES: Tuple[str, ...] = (
     "patch-bug",           
     "unit-fix",            
 
-     "noop",             
+    "noop",             
 )
 
 ACTION_TO_IDX = {a: i for i, a in enumerate(ACTION_TEMPLATES)}
