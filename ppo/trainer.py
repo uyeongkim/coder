@@ -46,7 +46,7 @@ class PPOConfig:
     rollout_len: int = 1
     gamma: float = 1.0
     gae_lambda: float = 1.0
-    clip_epsilon: float = 0.1
+    clip_epsilon: float = 0.05
     entropy_coef: float = 0.00
     value_coef: float = 0.5
     lr: float = 1e-8
@@ -55,7 +55,7 @@ class PPOConfig:
     
     # Multiple PPO epochs (unchanged)
     ppo_epochs: int = 4
-    mini_batch_size: int = 32
+    mini_batch_size: int = 16
     target_kl: float = 1.0
     
     # Top-K KL divergence settings (unchanged)
@@ -267,7 +267,7 @@ class PPOTrainer:
     def _setup_environments(self):
         """Setup environments (unchanged)"""
         train_env_cfg = EnvConfig(
-            batch_size=64,
+            batch_size=32,
             max_problem_length=self.cfg.max_problem_length,
             max_solution_length=self.cfg.max_solution_length,
             max_problems=100_000,
