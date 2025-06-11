@@ -20,6 +20,7 @@ from tqdm import tqdm
 from datasets import load_dataset
 import functools
 import hashlib
+import signal
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -227,7 +228,7 @@ class SafeCodeExecutor:
 
     @staticmethod
     def _run(code_str: str, input_str: str, q, timeout: float):
-        """Single execution worker"""
+        """Single execution worker - 개선된 timeout 처리"""
         with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
             f.write(
                 "import sys\n"
@@ -237,6 +238,7 @@ class SafeCodeExecutor:
                 "    print(str(solve(data)).strip())\n"
             )
             path = f.name
+        
         try:
             proc = subprocess.Popen(
                 [sys.executable, path],
@@ -244,17 +246,45 @@ class SafeCodeExecutor:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                # 프로세스 그룹 생성으로 더 확실한 종료
+                preexec_fn=os.setsid if hasattr(os, 'setsid') else None
             )
+            
             try:
                 out, err = proc.communicate(input=input_str, timeout=timeout)
+                status = "success" if proc.returncode == 0 else "error"
+                q.put((status, out.strip() if status == "success" else err.strip()))
             except subprocess.TimeoutExpired:
-                proc.kill()
+                # 더 확실한 프로세스 종료
+                try:
+                    if hasattr(os, 'killpg') and hasattr(os, 'getpgid'):
+                        # 프로세스 그룹 전체 종료
+                        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                    else:
+                        proc.terminate()
+                    
+                    # 잠시 기다렸다가 강제 종료
+                    try:
+                        proc.wait(timeout=0.2)
+                    except subprocess.TimeoutExpired:
+                        if hasattr(os, 'killpg') and hasattr(os, 'getpgid'):
+                            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                        else:
+                            proc.kill()
+                            
+                except (ProcessLookupError, OSError):
+                    # 프로세스가 이미 종료된 경우
+                    pass
+                
                 q.put(("timeout", "TimeoutError"))
-                return
-            status = "success" if proc.returncode == 0 else "error"
-            q.put((status, out.strip() if status == "success" else err.strip()))
+                
+        except Exception as e:
+            q.put(("error", str(e)))
         finally:
-            os.unlink(path)
+            try:
+                os.unlink(path)
+            except:
+                pass
 
     @staticmethod
     def execute_code_safely(code: str, inp: str, timeout: float) -> Tuple[bool, str]:
@@ -756,7 +786,7 @@ class BaseCodeEnv:
         else:
             # Parallel execution using ThreadPoolExecutor for I/O bound reward calculation
             try:
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                with ProcessPoolExecutor(max_workers=max_workers) as executor:
                     futures = [
                         executor.submit(self.reward_calculator.calculate_reward, task, sol)
                         for task, sol in zip(self.batch, solutions)
