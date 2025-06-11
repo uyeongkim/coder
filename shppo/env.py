@@ -196,7 +196,34 @@ class SafeCodeExecutor:
         return ok, out
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 5. SHPPOEnv: Planner → Coder → Debugger with public/private tests
+# 5. Module-level function for parallel execution (FIX)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _run_single_test(test_data: Tuple[int, str, str, str, float]) -> str:
+    """
+    Module-level function to run a single test case.
+    This can be pickled for ProcessPoolExecutor.
+    
+    Args:
+        test_data: (idx, code_str, inp, exp, timeout)
+    
+    Returns:
+        str: Log line for this test case
+    """
+    idx, code_str, inp, exp, timeout = test_data
+    ok, out = SafeCodeExecutor.execute(code_str, inp, timeout)
+    out = out.strip()
+    exp = str(exp).strip()
+    
+    if ok and out == exp:
+        status = "PASS"
+    else:
+        status = "FAIL"
+    
+    return f"PUB TC{idx}: {status}, out={out!r}, exp={exp!r}"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 6. SHPPOEnv: Planner → Coder → Debugger with public/private tests
 # ═══════════════════════════════════════════════════════════════════════════
 
 type_obs = TypedDict("Obs", {"role": str, "visible_files": Dict[str, str], "hidden_state": Any})
@@ -272,7 +299,7 @@ class SHPPOEnv(ABC):
         Executes public test cases on the given code_file and writes run_log.txt
         into work_dir. Returns the full log as a string.
         """
-        # Read the code (in case it’s not already on disk)
+        # Read the code (in case it's not already on disk)
         with open(code_file, 'r') as cf:
             code_str = cf.read()
 
@@ -281,33 +308,34 @@ class SHPPOEnv(ABC):
         passed = 0
         total = len(tests)
 
-        # Helper to run one test
-        def _run_one(idx, inp, exp):
-            ok, out = SafeCodeExecutor.execute(code_str, inp, self.cfg.test_timeout)
-            out = out.strip()
-            exp = str(exp).strip()
-            if ok and out == exp:
-                status = "PASS"
-                nonlocal passed
-                passed += 1
-            else:
-                status = "FAIL"
-            line = f"PUB TC{idx}: {status}, out={out!r}, exp={exp!r}"
-            return line
-
         # Parallel or serial execution
-        if self.cfg.use_parallel_execution:
+        if self.cfg.use_parallel_execution and len(tests) > 1:
             workers = self.cfg.max_workers or os.cpu_count() or 1
+            
+            # Prepare test data for parallel execution
+            test_data_list = [
+                (i, code_str, inp, outp, self.cfg.test_timeout)
+                for i, (inp, outp) in enumerate(tests)
+            ]
+            
             with ProcessPoolExecutor(max_workers=workers) as exe:
-                futures = [
-                    exe.submit(_run_one, i, inp, outp)
-                    for i, (inp, outp) in enumerate(tests)
-                ]
-                for fut in futures:
-                    log_lines.append(fut.result())
+                log_lines = list(exe.map(_run_single_test, test_data_list))
+                
+            # Count passed tests
+            passed = sum(1 for line in log_lines if "PASS" in line)
         else:
+            # Serial execution (fallback)
             for i, (inp, outp) in enumerate(tests):
-                log_lines.append(_run_one(i, inp, outp))
+                ok, out = SafeCodeExecutor.execute(code_str, inp, self.cfg.test_timeout)
+                out = out.strip()
+                exp = str(outp).strip()
+                if ok and out == exp:
+                    status = "PASS"
+                    passed += 1
+                else:
+                    status = "FAIL"
+                line = f"PUB TC{i}: {status}, out={out!r}, exp={exp!r}"
+                log_lines.append(line)
 
         # Write the aggregated log into work_dir/run_log.txt
         os.makedirs(work_dir, exist_ok=True)
@@ -325,15 +353,25 @@ class SHPPOEnv(ABC):
         tests = self.current_task.get("private_tests", [])
         log_lines: List[str] = []
         passed = 0; total = len(tests)
-        workers = self.cfg.max_workers or os.cpu_count() or 1
-        with ProcessPoolExecutor(max_workers=workers) as exe:
-            futures = [exe.submit(SafeCodeExecutor.execute, code_str, inp, self.cfg.test_timeout)
-                       for inp, _ in tests]
-            for i, fut in enumerate(futures):
-                ok, out = fut.result()
-                exp = str(tests[i][1]).strip()
+        
+        if self.cfg.use_parallel_execution and len(tests) > 1:
+            workers = self.cfg.max_workers or os.cpu_count() or 1
+            with ProcessPoolExecutor(max_workers=workers) as exe:
+                futures = [exe.submit(SafeCodeExecutor.execute, code_str, inp, self.cfg.test_timeout)
+                           for inp, _ in tests]
+                for i, fut in enumerate(futures):
+                    ok, out = fut.result()
+                    exp = str(tests[i][1]).strip()
+                    log_lines.append(f"PRI TC{i}: ok={ok}, out={out}, exp={exp}")
+                    if ok and out == exp: passed += 1
+        else:
+            # Serial execution (fallback)
+            for i, (inp, outp) in enumerate(tests):
+                ok, out = SafeCodeExecutor.execute(code_str, inp, self.cfg.test_timeout)
+                exp = str(outp).strip()
                 log_lines.append(f"PRI TC{i}: ok={ok}, out={out}, exp={exp}")
                 if ok and out == exp: passed += 1
+                
         with open(os.path.join(self.ep_dir or '', "private_run_log.txt"), 'w') as lf:
             lf.write("\n".join(log_lines))
         return passed / total if total>0 else 0.0

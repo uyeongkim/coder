@@ -205,6 +205,13 @@ class SHPPOTrainer:
             self.cfg.model_config, self.cfg.roles, device
         )
         
+        # Add embedding projection layer to match dimensions
+        # LLM output dimension -> model's expected input dimension
+        self.obs_projection = nn.Linear(
+            self.llm.model.config.hidden_size,  # LLM hidden size (896)
+            self.cfg.model_config.hete_layer_input_dim  # Expected input size (256)
+        ).to(device)
+        
         self.logger.info(f"Models initialized on {device}")
         self._log_model_parameters()
         
@@ -228,7 +235,11 @@ class SHPPOTrainer:
             role: torch.optim.Adam(actor.parameters(), lr=self.cfg.lr_actor)
             for role, actor in self.actors.items()
         }
-        self.opt_critic = torch.optim.Adam(self.critic.parameters(), lr=self.cfg.lr_critic)
+        
+        # Add projection layer to critic optimizer
+        critic_params = list(self.critic.parameters()) + list(self.obs_projection.parameters())
+        self.opt_critic = torch.optim.Adam(critic_params, lr=self.cfg.lr_critic)
+        
         self.opt_inference = torch.optim.Adam(self.inference_net.parameters(), lr=self.cfg.lr_critic)
         
         # LLM optimizer - only create if there are trainable parameters
@@ -244,8 +255,9 @@ class SHPPOTrainer:
         for name, param_group in [
             ("LLM", llm_params),
             ("Actor (planner)", list(self.actors["planner"].parameters())),
-            ("Critic", list(self.critic.parameters())),
-            ("Inference", list(self.inference_net.parameters()))
+            ("Critic", critic_params),
+            ("Inference", list(self.inference_net.parameters())),
+            ("Projection", list(self.obs_projection.parameters()))
         ]:
             trainable = [p for p in param_group if p.requires_grad]
             self.logger.info(f"{name}: {len(trainable)}/{len(param_group)} trainable parameters")
@@ -270,7 +282,10 @@ class SHPPOTrainer:
             # Get last hidden state as observation embedding
             outputs = self.llm.model(**inputs, output_hidden_states=True)
             # Use mean pooling of last hidden states and convert to float32
-            obs_emb = outputs.hidden_states[-1].mean(dim=1).float()  # [1, hidden_dim]
+            raw_emb = outputs.hidden_states[-1].mean(dim=1).float()  # [1, 896]
+            
+            # Project to expected dimension
+            obs_emb = self.obs_projection(raw_emb)  # [1, 256]
             
         return obs_emb
         
