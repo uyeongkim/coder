@@ -55,8 +55,8 @@ class PPOConfig:
     # LLM / LoRA (unchanged)
     base_model_name: str = "Qwen/Qwen2.5-Coder-0.5B-Instruct"
     target_modules: List[str] = field(default_factory=lambda: ["q_proj", "v_proj"])
-    lora_r: int = 32
-    lora_alpha: int = 64
+    lora_r: int = 4
+    lora_alpha: int = 8
 
     # Critic (unchanged)
     critic_hidden_dims: List[int] = field(default_factory=lambda: [])
@@ -67,7 +67,7 @@ class PPOConfig:
     gamma: float = 1.0
     gae_lambda: float = 1.0
     clip_epsilon: float = 0.1
-    entropy_coef: float = 0.00
+    entropy_coef: float = 0.0
     value_coef: float = 0.5
     lr: float = 1e-5
     final_lr: float = 1e-6
@@ -75,15 +75,16 @@ class PPOConfig:
     
     # Multiple PPO epochs (unchanged)
     ppo_epochs: int = 4
-    mini_batch_size: int = 16
-    kl_coef: float = 0.2
+    mini_batch_size: int = 32
+    grad_acc: int = 4  # Gradient accumulation steps
+    kl_coef: float = 0.5
     
     # Top-K KL divergence settings (unchanged)
     topk_for_kl: int = 1_000_000
     use_topk_kl: bool = False
 
     # Environment (unchanged)
-    num_envs: int = 32
+    num_envs: int = 128
     seed: int = 42
     max_problem_length: int = 1024
     max_solution_length: int = 512
@@ -267,7 +268,8 @@ class PPOTrainer:
         self.optimizer = torch.optim.AdamW(
             list(actor_params) + list(critic_params),
             lr=cfg.lr, 
-            eps=1e-8
+            eps=1e-8,
+            weight_decay=1e-4,
         )
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=cfg.updates, eta_min=cfg.final_lr
@@ -513,8 +515,7 @@ class PPOTrainer:
         self.last_rewards = torch.cat(collected_rewards, dim=0).to(self.device)
         
     def update(self):
-        """PPO update with detailed debugging messages"""
-        
+        """PPO update with gradient accumulation and detailed debugging messages"""
         self.buffer.compute_returns_advantages()
 
         # Check for NaN in advantages and returns - ABORT if found
@@ -525,7 +526,7 @@ class PPOTrainer:
         advantages = self.buffer.advantages
         adv_mean = advantages.mean()
         adv_std = advantages.std()
-        
+
         # Check advantage statistics for NaN
         if torch.isnan(adv_mean) or torch.isnan(adv_std):
             logger.error((
@@ -533,31 +534,29 @@ class PPOTrainer:
                 "🚨 ABORTING PROCESS DUE TO NaN IN ADVANTAGE STATISTICS"
             ))
             sys.exit(1)
-        
+
         # Standard normalization
         epsilon = 1e-8
         advantages_normalized = (advantages - adv_mean) / (adv_std + epsilon)
-        
-        
         # Check normalized advantages for NaN
         check_for_nan_and_abort(advantages_normalized, "normalized advantages", "after normalization")
+        advantages_normalized = torch.clamp(advantages_normalized, -5, 5) # clip the normalized advantages to avoid extreme values
 
         # 4. Data preparation
         total_samples = len(self.buffer.actions)
-        
+
         all_prompts = self.buffer.prompts
         all_states = torch.stack(self.buffer.states, dim=0)
         all_actions = self._pad_and_stack_actions(self.buffer.actions)
         all_old_logprobs = torch.stack(self.buffer.logprobs, dim=0)
         all_returns = self.buffer.returns
         all_advantages = advantages_normalized
-        
-        
+
         # Check stacked tensors for NaN
         check_for_nan_and_abort(all_states, "stacked states", "before update loop")
         check_for_nan_and_abort(all_actions, "stacked actions", "before update loop")
         check_for_nan_and_abort(all_old_logprobs, "stacked old_logprobs", "before update loop")
-        
+
         # 5. Training statistics initialization
         total_policy_loss = 0.0
         total_value_loss = 0.0
@@ -566,24 +565,27 @@ class PPOTrainer:
         total_batches = 0
         early_stopped = False
 
+        # Gradient accumulation setup
+        self.optimizer.zero_grad(set_to_none=True)
+        grad_accum_steps = cfg.grad_acc
+
         # Multiple epochs
         for epoch in trange(self.cfg.ppo_epochs, desc="PPO epochs", position=1, leave=False):
-            
             indices = torch.randperm(total_samples)
             epoch_policy_loss = 0.0
             epoch_value_loss = 0.0
             epoch_entropy = 0.0
             epoch_kl_div = 0.0
             epoch_batches = 0
-            
+
             for batch_idx, start_idx in enumerate(range(0, total_samples, self.cfg.mini_batch_size)):
                 end_idx = min(start_idx + self.cfg.mini_batch_size, total_samples)
                 mb_indices = indices[start_idx:end_idx]
-                
+
                 if len(mb_indices) == 0:
                     logger.warning(f"  ⚠️  Skipping empty batch {batch_idx}")
                     continue
-                
+
                 # Extract mini-batch
                 mb_prompts = [all_prompts[i] for i in mb_indices]
                 mb_states = all_states[mb_indices]
@@ -591,93 +593,91 @@ class PPOTrainer:
                 mb_old_logprobs = all_old_logprobs[mb_indices]
                 mb_returns = all_returns[mb_indices]
                 mb_advantages = all_advantages[mb_indices]
-                
+
                 # Check mini-batch for NaN
                 check_for_nan_and_abort(mb_states, "mini-batch states", f"epoch {epoch}, batch {batch_idx}")
                 check_for_nan_and_abort(mb_actions, "mini-batch actions", f"epoch {epoch}, batch {batch_idx}")
                 check_for_nan_and_abort(mb_old_logprobs, "mini-batch old_logprobs", f"epoch {epoch}, batch {batch_idx}")
                 check_for_nan_and_abort(mb_returns, "mini-batch returns", f"epoch {epoch}, batch {batch_idx}")
                 check_for_nan_and_abort(mb_advantages, "mini-batch advantages", f"epoch {epoch}, batch {batch_idx}")
-                
+
                 # Compute losses with debugging
                 with torch.cuda.amp.autocast(enabled=self.scaler is not None):
                     policy_loss, value_loss, entropy, kl_div = self._compute_losses_topk_kl_optimized(
-                        mb_prompts, mb_states, mb_actions, mb_old_logprobs, 
+                        mb_prompts, mb_states, mb_actions, mb_old_logprobs,
                         mb_returns, mb_advantages
                     )
-                
+
                 # Check losses for NaN - ABORT if found
                 if torch.isnan(policy_loss):
                     logger.error("❌ NaN in policy loss")
                     sys.exit(1)
-                    
+
                 if torch.isnan(value_loss):
                     logger.error("❌ NaN in value loss")
                     sys.exit(1)
-                    
+
                 if torch.isnan(entropy):
                     logger.error("❌ NaN in entropy")
                     sys.exit(1)
-                
+
                 # Compute total loss
                 total_loss = (
-                    policy_loss 
-                    + self.cfg.value_coef * value_loss 
+                    policy_loss
+                    + self.cfg.value_coef * value_loss
                     - self.cfg.entropy_coef * entropy
                     + self.cfg.kl_coef * kl_div
                 )
                 total_loss = torch.clamp(total_loss, min=-5, max=5)
-                
+
                 # Check total loss for NaN
                 check_for_nan_and_abort(total_loss, "total_loss", f"epoch {epoch}, batch {batch_idx}")
-                
-                self.optimizer.zero_grad()
-                
-                # Mixed precision backward pass
+
+                # --- Gradient accumulation logic ---
                 if self.scaler:
-                    self.scaler.scale(total_loss).backward()
-                    self.scaler.unscale_(self.optimizer)
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        list(self.actor.parameters()) + list(self.critic.parameters()),
-                        self.cfg.max_grad_norm
-                    )
-                    if not torch.isfinite(grad_norm):
-                        print(f"❌ Non-finite gradient norm: {grad_norm} at epoch {epoch}, batch {batch_idx}")
-                        self.scaler.update()  # Update scaler to avoid NaN/Inf issues
-                        self.optimizer.zero_grad()  # Reset gradients
-                        continue
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
+                    scaled_loss = self.scaler.scale(total_loss / grad_accum_steps)
+                    scaled_loss.backward()
                 else:
-                    total_loss.backward()
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        list(self.actor.parameters()) + list(self.critic.parameters()),
-                        self.cfg.max_grad_norm
-                    )
-                    self.optimizer.step()
-                
-                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
-                    # print(f"❌ NaN/Inf gradient norm: {grad_norm} at epoch {epoch}, batch {batch_idx}")
-                    # print("🚨 ABORTING PROCESS DUE TO NaN/Inf GRADIENTS")
-                    logger.error((
-                        f"❌ NaN/Inf gradient norm: {grad_norm} at epoch {epoch}, batch {batch_idx}\n"
-                        "🚨 ABORTING PROCESS DUE TO NaN/Inf GRADIENTS"
-                    ))
-                    sys.exit(1)
-                
+                    (total_loss / grad_accum_steps).backward()
+
+                if (batch_idx + 1) % grad_accum_steps == 0 or (batch_idx + 1 == math.ceil(total_samples / self.cfg.mini_batch_size)):
+                    if self.scaler:
+                        self.scaler.unscale_(self.optimizer)
+                        grad_norm = torch.nn.utils.clip_grad_norm_(
+                            list(self.actor.parameters()) + list(self.critic.parameters()),
+                            self.cfg.max_grad_norm
+                        )
+                        if not torch.isfinite(grad_norm):
+                            logger.warning(f"⚠️ Non-finite grad norm: {grad_norm} — skipping update")
+                            self.optimizer.zero_grad(set_to_none=True)
+                            return
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                    else:
+                        grad_norm = torch.nn.utils.clip_grad_norm_(
+                            list(self.actor.parameters()) + list(self.critic.parameters()),
+                            self.cfg.max_grad_norm
+                        )
+                        if not torch.isfinite(grad_norm):
+                            logger.warning(f"⚠️ Non-finite grad norm: {grad_norm} — skipping update")
+                            self.optimizer.zero_grad(set_to_none=True)
+                            return
+                        self.optimizer.step()
+                    self.optimizer.zero_grad(set_to_none=True)
+
                 # Accumulate statistics
                 total_policy_loss += policy_loss.item()
                 total_value_loss += value_loss.item()
                 total_entropy += entropy.item()
                 total_kl_div += kl_div
                 total_batches += 1
-                
+
                 epoch_policy_loss += policy_loss.item()
                 epoch_value_loss += value_loss.item()
                 epoch_entropy += entropy.item()
                 epoch_kl_div += kl_div
                 epoch_batches += 1
-                
+
                 # More frequent memory cleanup
                 if total_batches % self.cfg.cleanup_frequency == 0:
                     torch.cuda.empty_cache()
@@ -688,17 +688,15 @@ class PPOTrainer:
         old_lr = self.optimizer.param_groups[0]['lr']
         self.scheduler.step()
         new_lr = self.optimizer.param_groups[0]['lr']
-        
+
         self.total_updates += 1
 
         # Final statistics
-        
         if total_batches > 0:
             avg_policy_loss = total_policy_loss / total_batches
             avg_value_loss = total_value_loss / total_batches
             avg_entropy = total_entropy / total_batches
             avg_kl_div = total_kl_div / total_batches
-            
         else:
             logger.warning("  ⚠️  No batches processed due to early stopping")
             avg_policy_loss = 0.0
@@ -712,7 +710,6 @@ class PPOTrainer:
             'value_loss': avg_value_loss,
             'entropy': avg_entropy,
             'kl_divergence': avg_kl_div,
-            'epochs_completed': epoch + 1 if 'epoch' in locals() else 0,
             'early_stopped': early_stopped
         }
 
@@ -1020,13 +1017,11 @@ class PPOTrainer:
                 "train/value_loss": update_info['value_loss'],
                 "train/entropy": update_info['entropy'],
                 "train/kl_divergence": update_info['kl_divergence'],
-                "train/epochs_completed": update_info['epochs_completed'],
                 "train/early_stopped": update_info['early_stopped'],
                 "train/average_reward": avg_rewards,
                 "train/pass_rate": pass_rate,
                 "train/error_rate": error_rate,
                 "train/positive_rate": positive_rate,
-                "train/topk_kl_k": self.cfg.topk_for_kl,
             }
 
             # Check all log values for NaN
