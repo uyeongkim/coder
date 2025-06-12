@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from torch.cuda.amp import autocast, GradScaler  # Mixed precision for speed
 from tqdm import trange, tqdm
 import wandb
+from transformers import get_cosine_schedule_with_warmup
 
 # --------------------------------------------------------------------------- #
 # Local imports
@@ -26,9 +27,9 @@ from yy_env import (
 )
 
 from ppo.model import build_actor_and_critic
-from ppo.utils import RolloutBuffer, set_seed
+from ppo.utils import RolloutBuffer, set_seed, check_for_nan_and_abort, SimpleCache
 
-# =═══════════════════════════════════════════════════════════════════════════
+# =═══════════════════════════════════════════════════════════════════════════logger, 
 # Set up rich logging
 # ═══════════════════════════════════════════════════════════════════════
 RICH_FORMAT = "[%(filename)s:%(lineno)s] >> %(message)s"
@@ -55,14 +56,14 @@ class PPOConfig:
     # LLM / LoRA (unchanged)
     base_model_name: str = "Qwen/Qwen2.5-Coder-0.5B-Instruct"
     target_modules: List[str] = field(default_factory=lambda: ["q_proj", "v_proj"])
-    lora_r: int = 4
-    lora_alpha: int = 8
+    lora_r: int = 16
+    lora_alpha: int = 32
 
     # Critic (unchanged)
     critic_hidden_dims: List[int] = field(default_factory=lambda: [])
 
     # PPO (unchanged)
-    updates: int = 10
+    updates: int = 1000
     rollout_len: int = 1
     gamma: float = 1.0
     gae_lambda: float = 1.0
@@ -72,11 +73,12 @@ class PPOConfig:
     lr: float = 1e-5
     final_lr: float = 1e-6
     max_grad_norm: float = 0.5
+    warmup_ratio: float = 0.01  # Warmup ratio for learning rate schedule
     
     # Multiple PPO epochs (unchanged)
-    ppo_epochs: int = 4
+    ppo_epochs: int = 1
     mini_batch_size: int = 32
-    grad_acc: int = 4  # Gradient accumulation steps
+    grad_acc: int = 16  # Gradient accumulation steps
     kl_coef: float = 0.5
     
     # Top-K KL divergence settings (unchanged)
@@ -84,7 +86,7 @@ class PPOConfig:
     use_topk_kl: bool = False
 
     # Environment (unchanged)
-    num_envs: int = 128
+    num_envs: int = 512
     seed: int = 42
     max_problem_length: int = 1024
     max_solution_length: int = 512
@@ -94,42 +96,6 @@ class PPOConfig:
     use_mixed_precision: bool = True     # Easy 30-50% speedup
     use_compile: bool = True             # PyTorch 2.0 compile for speed
     cleanup_frequency: int = 10          # Memory cleanup every N batches
-
-
-def check_for_nan_and_abort(tensor, name, step_info=""):
-    """Check tensor for NaN and abort if found"""
-    if torch.isnan(tensor).any():
-        logger.error((
-            f"❌ NaN detected in {name} at {step_info}\n"
-            f"   Tensor shape: {tensor.shape}\n"
-            f"   Tensor stats: min={tensor.min()}, max={tensor.max()}, mean={tensor.mean()}\n"
-            f"   NaN count: {torch.isnan(tensor).sum()}\n"
-            f"   Inf count: {torch.isinf(tensor).sum()}\n"
-            "🚨 ABORTING PROCESS DUE TO NaN"
-        ))
-        sys.exit(1)
-
-
-# Simple tokenization cache for repeated prompts
-class SimpleCache:
-    def __init__(self, max_size=1000):
-        self.cache = {}
-        self.max_size = max_size
-    
-    def get_or_compute(self, key, compute_fn):
-        if key in self.cache:
-            return self.cache[key]
-        
-        result = compute_fn()
-        
-        # Simple cache management
-        if len(self.cache) >= self.max_size:
-            # Remove first item (simple FIFO)
-            first_key = next(iter(self.cache))
-            del self.cache[first_key]
-        
-        self.cache[key] = result
-        return result
 
 
 def compute_topk_logprobs_for_sequences_optimized(model, tokenizer, prompts, sequences, k=50, device='cuda', use_amp=True):
@@ -271,8 +237,11 @@ class PPOTrainer:
             eps=1e-8,
             weight_decay=1e-4,
         )
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=cfg.updates, eta_min=cfg.final_lr
+        from transformers import get_cosine_schedule_with_warmup
+        self.scheduler = get_cosine_schedule_with_warmup(
+            self.optimizer,
+            num_warmup_steps=int(cfg.warmup_ratio * cfg.updates),
+            num_training_steps=cfg.updates,
         )
 
         # ───── Environment Setup (unchanged) ─────────────────────────── #
@@ -282,7 +251,7 @@ class PPOTrainer:
         self.buffer = RolloutBuffer(cfg.gamma, cfg.gae_lambda)
 
         # Weights & Biases (unchanged)
-        wandb.init(project="yy-ppo-topk-kl-optimized", config=cfg, reinit=True)
+        wandb.init(project="ppo", config=cfg, reinit=True)
         
         self.total_updates = 0
 
@@ -358,8 +327,8 @@ class PPOTrainer:
                     gen = self.actor.generate(prompts)
                 
                 # Check for NaN in generation
-                check_for_nan_and_abort(gen["sequences"], "generated sequences", f"batch {batch_idx}")
-                check_for_nan_and_abort(gen["logprobs"], "generated logprobs", f"batch {batch_idx}")
+                check_for_nan_and_abort(gen["sequences"], "generated sequences", logger, f"batch {batch_idx}")
+                check_for_nan_and_abort(gen["logprobs"], "generated logprobs", logger, f"batch {batch_idx}")
                 
                 # Mixed precision for hidden states
                 if self.cfg.use_mixed_precision:
@@ -377,7 +346,7 @@ class PPOTrainer:
                 last_hidden = outputs.hidden_states[-1][:, -1, :].float()
                 
                 # Check for NaN in hidden states
-                check_for_nan_and_abort(last_hidden, "hidden states", f"batch {batch_idx}")
+                check_for_nan_and_abort(last_hidden, "hidden states", logger, f"batch {batch_idx}")
                 
                 # Critic processing (unchanged logic)
                 if hasattr(self.critic, 'module'):
@@ -402,7 +371,7 @@ class PPOTrainer:
                         values = critic_module(last_hidden).detach()
                 
                 # Check for NaN in values
-                check_for_nan_and_abort(values, "critic values", f"batch {batch_idx}")
+                check_for_nan_and_abort(values, "critic values", logger, f"batch {batch_idx}")
                 
                 # Move to CPU (unchanged)
                 states_cpu = last_hidden.cpu()
@@ -417,10 +386,10 @@ class PPOTrainer:
                     torch.cuda.empty_cache()
                 
             # Final NaN check before storing
-            check_for_nan_and_abort(states_cpu, "states_cpu", f"batch {batch_idx}")
-            check_for_nan_and_abort(actions_cpu, "actions_cpu", f"batch {batch_idx}")
-            check_for_nan_and_abort(logprobs_cpu, "logprobs_cpu", f"batch {batch_idx}")
-            check_for_nan_and_abort(values_cpu, "values_cpu", f"batch {batch_idx}")
+            check_for_nan_and_abort(states_cpu, "states_cpu", logger, f"batch {batch_idx}")
+            check_for_nan_and_abort(actions_cpu, "actions_cpu", logger, f"batch {batch_idx}")
+            check_for_nan_and_abort(logprobs_cpu, "logprobs_cpu", logger, f"batch {batch_idx}")
+            check_for_nan_and_abort(values_cpu, "values_cpu", logger, f"batch {batch_idx}")
             
             gpu_data_batches.append({
                 'prompts': prompts.copy(),
@@ -519,8 +488,8 @@ class PPOTrainer:
         self.buffer.compute_returns_advantages()
 
         # Check for NaN in advantages and returns - ABORT if found
-        check_for_nan_and_abort(self.buffer.advantages, "buffer advantages", "update start")
-        check_for_nan_and_abort(self.buffer.returns, "buffer returns", "update start")
+        check_for_nan_and_abort(self.buffer.advantages, "buffer advantages", logger, "update start")
+        check_for_nan_and_abort(self.buffer.returns, "buffer returns", logger,  "update start")
 
         # 3. Advantage normalization with debugging
         advantages = self.buffer.advantages
@@ -539,7 +508,7 @@ class PPOTrainer:
         epsilon = 1e-8
         advantages_normalized = (advantages - adv_mean) / (adv_std + epsilon)
         # Check normalized advantages for NaN
-        check_for_nan_and_abort(advantages_normalized, "normalized advantages", "after normalization")
+        check_for_nan_and_abort(advantages_normalized, "normalized advantagelogger, s", "after normalization")
         advantages_normalized = torch.clamp(advantages_normalized, -5, 5) # clip the normalized advantages to avoid extreme values
 
         # 4. Data preparation
@@ -553,9 +522,9 @@ class PPOTrainer:
         all_advantages = advantages_normalized
 
         # Check stacked tensors for NaN
-        check_for_nan_and_abort(all_states, "stacked states", "before update loop")
-        check_for_nan_and_abort(all_actions, "stacked actions", "before update loop")
-        check_for_nan_and_abort(all_old_logprobs, "stacked old_logprobs", "before update loop")
+        check_for_nan_and_abort(all_states, "stacked states",logger,  "before update loop")
+        check_for_nan_and_abort(all_actions, "stacked actions",logger,  "before update loop")
+        check_for_nan_and_abort(all_old_logprobs, "stacked old_logprobs",logger,  "before update loop")
 
         # 5. Training statistics initialization
         total_policy_loss = 0.0
@@ -595,11 +564,11 @@ class PPOTrainer:
                 mb_advantages = all_advantages[mb_indices]
 
                 # Check mini-batch for NaN
-                check_for_nan_and_abort(mb_states, "mini-batch states", f"epoch {epoch}, batch {batch_idx}")
-                check_for_nan_and_abort(mb_actions, "mini-batch actions", f"epoch {epoch}, batch {batch_idx}")
-                check_for_nan_and_abort(mb_old_logprobs, "mini-batch old_logprobs", f"epoch {epoch}, batch {batch_idx}")
-                check_for_nan_and_abort(mb_returns, "mini-batch returns", f"epoch {epoch}, batch {batch_idx}")
-                check_for_nan_and_abort(mb_advantages, "mini-batch advantages", f"epoch {epoch}, batch {batch_idx}")
+                check_for_nan_and_abort(mb_states, "mini-batch states", logger, f"epoch {epoch}, batch {batch_idx}")
+                check_for_nan_and_abort(mb_actions, "mini-batch actions", logger, f"epoch {epoch}, batch {batch_idx}")
+                check_for_nan_and_abort(mb_old_logprobs, "mini-batch old_logprobs", logger, f"epoch {epoch}, batch {batch_idx}")
+                check_for_nan_and_abort(mb_returns, "mini-batch returns", logger, f"epoch {epoch}, batch {batch_idx}")
+                check_for_nan_and_abort(mb_advantages, "mini-batch advantages", logger, f"epoch {epoch}, batch {batch_idx}")
 
                 # Compute losses with debugging
                 with torch.cuda.amp.autocast(enabled=self.scaler is not None):
@@ -631,7 +600,7 @@ class PPOTrainer:
                 total_loss = torch.clamp(total_loss, min=-5, max=5)
 
                 # Check total loss for NaN
-                check_for_nan_and_abort(total_loss, "total_loss", f"epoch {epoch}, batch {batch_idx}")
+                check_for_nan_and_abort(total_loss, "total_loss", logger, f"epoch {epoch}, batch {batch_idx}")
 
                 # --- Gradient accumulation logic ---
                 if self.scaler:
@@ -746,11 +715,11 @@ class PPOTrainer:
         advantages = advantages.to(self.device)
         
         # Check inputs for NaN
-        check_for_nan_and_abort(states, "loss_computation_states", "loss computation start")
-        check_for_nan_and_abort(actions.float(), "loss_computation_actions", "loss computation start")
-        check_for_nan_and_abort(old_logprobs, "loss_computation_old_logprobs", "loss computation start")
-        check_for_nan_and_abort(returns, "loss_computation_returns", "loss computation start")
-        check_for_nan_and_abort(advantages, "loss_computation_advantages", "loss computation start")
+        check_for_nan_and_abort(states, "loss_computation_states",logger,  "loss computation start")
+        check_for_nan_and_abort(actions.float(), "loss_computation_actions",logger,  "loss computation start")
+        check_for_nan_and_abort(old_logprobs, "loss_computation_old_logprobs",logger,  "loss computation start")
+        check_for_nan_and_abort(returns, "loss_computation_returns",logger,  "loss computation start")
+        check_for_nan_and_abort(advantages, "loss_computation_advantages",logger,  "loss computation start")
         
         # Memory cleanup before heavy computation
         if self.total_updates % self.cfg.cleanup_frequency == 0:
@@ -770,18 +739,18 @@ class PPOTrainer:
                 new_logprobs = self._compute_logprobs_for_sequences_original_optimized(prompts, actions)
                 new_logprobs = new_logprobs.to(self.device)
                 
-            check_for_nan_and_abort(new_logprobs, "new_logprobs", "after logprob computation")
+            check_for_nan_and_abort(new_logprobs, "new_logprobs",logger,  "after logprob computation")
         except torch.cuda.OutOfMemoryError:
             print("❌ OOM during log probability computation")
             sys.exit(1)
         
         # Compute importance ratio with simple, stable clamping (unchanged logic)
         log_ratio = new_logprobs - old_logprobs
-        check_for_nan_and_abort(log_ratio, "log_ratio", "importance ratio computation")
+        check_for_nan_and_abort(log_ratio, "log_ratio",logger,  "importance ratio computation")
         
         log_ratio_clamped = torch.clamp(log_ratio, min=-5.0, max=5.0)
         ratio = torch.exp(log_ratio_clamped)
-        check_for_nan_and_abort(ratio, "importance_ratio", "after exp")
+        check_for_nan_and_abort(ratio, "importance_ratilogger, o", "after exp")
         
         # Use the clamped log_ratio for KL divergence calculation
         kl_div = -log_ratio_clamped.mean().item()
@@ -792,11 +761,11 @@ class PPOTrainer:
             ratio, 1.0 - self.cfg.clip_epsilon, 1.0 + self.cfg.clip_epsilon
         )
         
-        check_for_nan_and_abort(policy_loss_1, "policy_loss_1", "policy loss computation")
-        check_for_nan_and_abort(policy_loss_2, "policy_loss_2", "policy loss computation")
+        check_for_nan_and_abort(policy_loss_1, "policy_loss_1",logger,  "policy loss computation")
+        check_for_nan_and_abort(policy_loss_2, "policy_loss_2",logger,  "policy loss computation")
         
         policy_loss = -torch.min(policy_loss_1, policy_loss_2).mean()
-        check_for_nan_and_abort(policy_loss, "final_policy_loss", "policy loss final")
+        check_for_nan_and_abort(policy_loss, "final_policy_loss",logger,  "policy loss final")
         
         # Value loss with mixed precision
         if self.cfg.use_mixed_precision:
@@ -807,12 +776,12 @@ class PPOTrainer:
             current_values = self.critic(states).squeeze(-1)
             value_loss = 0.5 * ((current_values - returns) ** 2).mean()
             
-        check_for_nan_and_abort(current_values, "current_values", "critic forward pass")
-        check_for_nan_and_abort(value_loss, "value_loss", "value loss computation")
+        check_for_nan_and_abort(current_values, "current_values",logger,  "critic forward pass")
+        check_for_nan_and_abort(value_loss, "value_loss",logger,  "value loss computation")
         
         # Entropy (unchanged)
         entropy = -new_logprobs.var()
-        check_for_nan_and_abort(entropy, "entropy", "entropy computation")
+        check_for_nan_and_abort(entropy, "entropy", logger, "entropy computation")
         
         # KL divergence validation (unchanged)
         if math.isnan(kl_div):
@@ -855,7 +824,7 @@ class PPOTrainer:
             batch_sequences = sequences[i:end_idx]
             
             batch_log_probs = self._compute_logprobs_single_batch_original_optimized(batch_prompts, batch_sequences)
-            check_for_nan_and_abort(batch_log_probs, f"batch_log_probs_{i}", "logprob computation")
+            check_for_nan_and_abort(batch_log_probs, f"batch_log_probs_{logger, i}", "logprob computation")
             all_log_probs.append(batch_log_probs)
             
             # More frequent cleanup
@@ -863,7 +832,7 @@ class PPOTrainer:
                 torch.cuda.empty_cache()
         
         result = torch.cat(all_log_probs, dim=0)
-        check_for_nan_and_abort(result, "concatenated_log_probs", "logprob computation final")
+        check_for_nan_and_abort(result, "concatenated_log_probs",logger,  "logprob computation final")
         return result
     
     def _compute_logprobs_single_batch_original_optimized(self, prompts, sequences):
@@ -872,7 +841,7 @@ class PPOTrainer:
         device = next(model.parameters()).device
         
         sequences = sequences.to(device)
-        check_for_nan_and_abort(sequences.float(), "input sequences", "logprob computation start")
+        check_for_nan_and_abort(sequences.float(), "input sequences",logger,  "logprob computation start")
         
         # Use cache for tokenization
         cache_key = str(hash(tuple(prompts)))
@@ -908,7 +877,7 @@ class PPOTrainer:
                         use_cache=False
                     )
                     logits = outputs.logits.float()
-                    check_for_nan_and_abort(logits, "model logits", "forward pass")
+                    check_for_nan_and_abort(logits, "model logits", logger, "forward pass")
                     
             else:
                 # Non-mixed precision fallback
@@ -918,7 +887,7 @@ class PPOTrainer:
                     use_cache=False
                 )
                 logits = outputs.logits.float()
-                check_for_nan_and_abort(logits, "model logits", "forward pass")
+                check_for_nan_and_abort(logits, "model logits", logger, "forward pass")
                 
         
         # Process in chunks (unchanged logic but with optimizations)
@@ -931,7 +900,7 @@ class PPOTrainer:
             chunk_logits = logits[:, start_idx:end_idx, :]
             
             chunk_log_probs = F.log_softmax(chunk_logits, dim=-1)
-            check_for_nan_and_abort(chunk_log_probs, f"chunk_log_probs_{start_idx}", "log_softmax")
+            check_for_nan_and_abort(chunk_log_probs, f"chunk_log_probs_{start_idx}", logger, "log_softmax")
             all_log_probs.append(chunk_log_probs)
             
             del chunk_logits, chunk_log_probs
@@ -940,7 +909,7 @@ class PPOTrainer:
                 torch.cuda.empty_cache()
         
         log_probs = torch.cat(all_log_probs, dim=1)
-        check_for_nan_and_abort(log_probs, "concatenated_log_probs", "after chunking")
+        check_for_nan_and_abort(log_probs, "concatenated_log_probs", logger, "after chunking")
         del all_log_probs
         
         generated_tokens = sequences[:, prompt_length:].to(device)
@@ -963,12 +932,12 @@ class PPOTrainer:
         gen_attention_mask = attention_mask[:, prompt_length:prompt_length+min_length] if attention_mask is not None else torch.ones_like(generated_tokens).float().to(device)
         
         token_log_probs = generated_logits.gather(2, generated_tokens.unsqueeze(-1)).squeeze(-1)
-        check_for_nan_and_abort(token_log_probs, "token_log_probs", "after gather")
+        check_for_nan_and_abort(token_log_probs, "token_log_probs", logger, "after gather")
         
         masked_token_log_probs = token_log_probs * gen_attention_mask
         sequence_log_probs = masked_token_log_probs.sum(dim=-1)
         
-        check_for_nan_and_abort(sequence_log_probs, "final_sequence_log_probs", "logprob computation end")
+        check_for_nan_and_abort(sequence_log_probs, "final_sequence_log_probs",logger,  "logprob computation end")
         
         del log_probs, generated_logits, token_log_probs, masked_token_log_probs
         torch.cuda.empty_cache()
@@ -983,7 +952,7 @@ class PPOTrainer:
             self.env.reset_batch()
 
             # Check final rewards for NaN
-            check_for_nan_and_abort(self.last_rewards, "final_rewards", f"update {upd}")
+            check_for_nan_and_abort(self.last_rewards, "final_rewards", logger, f"update {upd}")
 
             pass_rate = float((self.last_rewards >= 0.99).sum().item() / self.last_rewards.size(0))
             error_rate = float((self.last_rewards < 0).sum().item() / self.last_rewards.size(0))
@@ -1055,7 +1024,7 @@ class PPOTrainer:
     def _batch_eval(self, env, tasks: list[dict]) -> tuple[float, float]:
         """Evaluation with optimizations"""
         batch_size = 100
-        total_reward = 0.0
+        total_passed = 0
         total_success = 0
         total = 0
         
@@ -1077,7 +1046,7 @@ class PPOTrainer:
                     gen = self.actor.generate(prompts)
                 
                 # Check for NaN in evaluation generation
-                check_for_nan_and_abort(gen["logprobs"], "eval_generation_logprobs", f"evaluation batch {i}")
+                check_for_nan_and_abort(gen["logprobs"], "eval_generation_logprobs", logger, f"evaluation batch {i}")
                     
                 rewards = env.step_batch(gen["texts"])
                 
@@ -1092,7 +1061,7 @@ class PPOTrainer:
                         ))
                         sys.exit(1)
                 
-                total_reward += sum(rewards)
+                total_passed += sum(r >= 0.0 for r in rewards)
                 total_success += sum(r >= 0.99 for r in rewards)
                 total += len(rewards)
                 
@@ -1103,30 +1072,30 @@ class PPOTrainer:
         if total == 0:
             return 0.0, 0.0
             
-        avg_reward = total_reward / total
+        avg_passed = total_passed / total
         pass_rate = total_success / total
         
         # Check final evaluation results for NaN
-        if math.isnan(avg_reward) or math.isnan(pass_rate):
+        if math.isnan(avg_passed) or math.isnan(pass_rate):
             # print(f"❌ NaN in evaluation results: avg_reward={avg_reward}, pass_rate={pass_rate}")
             # print("🚨 ABORTING PROCESS DUE TO NaN IN EVALUATION RESULTS")
             logger.error((
-                f"❌ NaN in evaluation results: avg_reward={avg_reward}, pass_rate={pass_rate}\n"
+                f"❌ NaN in evaluation results: avg_reward={avg_passed}, pass_rate={pass_rate}\n"
                 "🚨 ABORTING PROCESS DUE TO NaN IN EVALUATION RESULTS"
             ))
             sys.exit(1)
             
-        return avg_reward, pass_rate
+        return avg_passed, pass_rate
 
     def evaluate(self, n: int = 100):
         """Evaluation with optimizations"""
         try:
             all_probs = self.eval_env.get_all_problems()
             sample = random.sample(all_probs, min(n, len(all_probs)))
-            avg_r, pass_r = self._batch_eval(self.eval_env, sample)
+            avg_p, pass_r = self._batch_eval(self.eval_env, sample)
             
             wandb.log({
-                "eval/average_reward": avg_r,
+                "eval/average_passed": avg_p,
                 "eval/pass_rate": pass_r,
                 "eval/num_samples": len(sample),
             }, step=self.global_step)
@@ -1137,12 +1106,12 @@ class PPOTrainer:
     def test(self):
         """Test with optimizations"""
         try:
-            avg_r, pass_r = self._batch_eval(
+            avg_p, pass_r = self._batch_eval(
                 self.test_env, self.test_env.get_all_problems()
             )
             
             wandb.log({
-                "test/average_reward": avg_r,
+                "test/average_passed": avg_p,
                 "test/pass_rate": pass_r,
                 "test/num_samples": len(self.test_env.get_all_problems()),
             }, step=self.global_step)

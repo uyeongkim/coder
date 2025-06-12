@@ -5,6 +5,7 @@ utils.py ― tiny helper utilities (GAE, RolloutBuffer, seeding)
 from __future__ import annotations
 from dataclasses import dataclass
 import torch
+import sys
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -92,3 +93,42 @@ class RolloutBuffer:
         self.rewards, self.values = [], []
         self.prompts = []
         self.returns, self.advantages = None, None
+        
+        
+# ──────────────────────────────────────────────────────────────────────────
+# Else
+# ──────────────────────────────────────────────────────────────────────────
+
+def check_for_nan_and_abort(tensor, name, logger, step_info="",):
+    """Check tensor for NaN and abort if found"""
+    if torch.isnan(tensor).any():
+        logger.error((
+            f"❌ NaN detected in {name} at {step_info}\n"
+            f"   Tensor shape: {tensor.shape}\n"
+            f"   Tensor stats: min={tensor.min()}, max={tensor.max()}, mean={tensor.mean()}\n"
+            f"   NaN count: {torch.isnan(tensor).sum()}\n"
+            f"   Inf count: {torch.isinf(tensor).sum()}\n"
+            "🚨 ABORTING PROCESS DUE TO NaN"
+        ))
+        sys.exit(1)
+        
+# Simple tokenization cache for repeated prompts
+class SimpleCache:
+    def __init__(self, max_size=1000):
+        self.cache = {}
+        self.max_size = max_size
+    
+    def get_or_compute(self, key, compute_fn):
+        if key in self.cache:
+            return self.cache[key]
+        
+        result = compute_fn()
+        
+        # Simple cache management
+        if len(self.cache) >= self.max_size:
+            # Remove first item (simple FIFO)
+            first_key = next(iter(self.cache))
+            del self.cache[first_key]
+        
+        self.cache[key] = result
+        return result

@@ -12,7 +12,20 @@ import numpy as np
 from dataclasses import dataclass
 from typing import List, Sequence, Dict, Any
 
+import sys
 import torch
+
+# =============================================================
+# Extra: Sanity check for NaN/infs in tensors
+# =============================================================
+
+def check_for_nan_and_abort(tensor: torch.Tensor, name: str, logger, context: str = ""):
+    """
+    Checks a tensor for NaNs or infinite values. Logs an error and aborts if any are found.
+    """
+    if not torch.isfinite(tensor).all():
+        logger.error(f"Detected non-finite values in {name}. Context: {context}")
+        sys.exit(1)
 
 # ═════════════════════════════════════════════════════════════
 # 1.  Global seeding

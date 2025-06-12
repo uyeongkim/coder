@@ -805,12 +805,12 @@ class BaseCodeEnv:
     def get_all_problems(self) -> List[Dict[str, Any]]:
         return self.dataset
     
-    def get_performance_stats(self) -> Dict[str, float]:
+    def get_performance_stats(self, n_hist: int = 100) -> Dict[str, float]:
         """Get recent performance statistics"""
         if not self.performance_history:
             return {}
         
-        recent = self.performance_history[-100:]  # Last 100 episodes
+        recent = self.performance_history[-n_hist:] if n_hist > 0 else self.performance_history
         return {
             "avg_reward": sum(recent) / len(recent),
             "pass_rate": sum(1 for r in recent if r >= 0.99) / len(recent),
