@@ -93,16 +93,23 @@ class LLMActor(nn.Module):
         """
         
         # Tokenize inputs on the model's device
-        inputs = self.tokenizer(
-            prompts,
+        messages = [
+            [{"role": "system", "content": "You are a coding expert"},
+             {"role": "user",   "content": p}]
+            for p in prompts
+        ]
+        input_ids = self.tokenizer.apply_chat_template(
+            messages,
             return_tensors="pt",
+            add_generation_prompt=True,
             padding=True,
             truncation=True,
-            max_length=self.cfg.max_problem_length,
-        )
-        
+            max_length=self.cfg.max_problem_length + 100,
+        )  # -> Tensor[B, L]
         embed_device = next(self.model.base_model.model.model.embed_tokens.parameters()).device
-        inputs = {k: v.to(embed_device) for k, v in inputs.items()}
+        input_ids = input_ids.to(embed_device)
+        attention_mask = (input_ids != self.tokenizer.pad_token_id).long().to(embed_device)
+        inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
 
         gen_out = self.model.generate(
             **inputs,
@@ -119,12 +126,13 @@ class LLMActor(nn.Module):
 
         seqs = gen_out.sequences              # [B, T_prompt + T_gen]
         logps = self._logprobs_from_scores(gen_out.scores, seqs).sum(dim=-1)
-
+        prompt_len = inputs["input_ids"].shape[1]
+        gen_ids = seqs[:, prompt_len:]  # [B, T_gen]
         texts = self.tokenizer.batch_decode(
-            seqs[:, inputs["input_ids"].shape[1]:],
+            gen_ids,
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False,
-        )
+        )  # list[str] of length B
 
         return {"sequences": seqs, "texts": texts, "logprobs": logps}
 

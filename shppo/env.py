@@ -13,6 +13,7 @@ import multiprocessing
 import random
 import hashlib
 import signal
+import shutil
 from abc import ABC
 from dataclasses import dataclass
 from enum import Enum
@@ -37,7 +38,9 @@ class EnvConfig:
     cache_extracted_functions: bool = True
     precompute_test_hashes: bool = True
     test_timeout: float = 5.0             # seconds per test
-    root_dir: str = "/tmp/shppo_env"  # Base directory for episodes
+    use_temp_dir: bool = True             # Use system temp directory
+    temp_dir_prefix: str = "shppo_env_"   # Prefix for temp directories
+    cleanup_on_exit: bool = True          # Clean up temp dirs when done
 
 class RewardType(Enum):
     SIMPLE = "simple"
@@ -233,25 +236,48 @@ class SHPPOEnv(ABC):
     def __init__(self, cfg: EnvConfig):
         self.cfg = cfg
         self.dataset = CodeContestDataset(cfg)
-        os.makedirs(self.cfg.root_dir, exist_ok=True)
         self.roles = ["planner", "coder", "debugger"]
         self.step_idx = 0
         self.ep_dir: Optional[str] = None
         self.current_task: Dict[str, Any] = {}
+        self.temp_dirs: List[str] = []  # Track temp directories for cleanup
 
     def reset(self) -> type_obs:
         self.step_idx = 0
         self.current_task = self.dataset.sample()
-        self.ep_dir = os.path.join(
-            self.cfg.root_dir,
-            hashlib.md5(str(random.random()).encode()).hexdigest()
-        )
-        os.makedirs(self.ep_dir, exist_ok=True)
+        
+        # Create temporary directory for this episode
+        if self.cfg.use_temp_dir:
+            self.ep_dir = tempfile.mkdtemp(prefix=self.cfg.temp_dir_prefix)
+            self.temp_dirs.append(self.ep_dir)
+        else:
+            # Fallback to old behavior if needed
+            self.ep_dir = os.path.join(
+                "/tmp/shppo_env",
+                hashlib.md5(str(random.random()).encode()).hexdigest()
+            )
+            os.makedirs(self.ep_dir, exist_ok=True)
+        
         # write problem
         prob = self.current_task["description"]
         with open(os.path.join(self.ep_dir, "problem.md"), 'w') as f:
             f.write(prob)
         return self._obs_for(self.roles[0])
+
+    def cleanup(self):
+        """Clean up temporary directories"""
+        if self.cfg.cleanup_on_exit:
+            for temp_dir in self.temp_dirs:
+                if os.path.exists(temp_dir):
+                    try:
+                        shutil.rmtree(temp_dir)
+                    except Exception as e:
+                        print(f"Warning: Failed to cleanup temp dir {temp_dir}: {e}")
+            self.temp_dirs.clear()
+
+    def __del__(self):
+        """Cleanup when object is destroyed"""
+        self.cleanup()
 
     def step(self, action: type_act) -> Tuple[type_obs, float, bool, dict]:
         if not self.ep_dir:

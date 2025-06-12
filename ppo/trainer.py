@@ -3,6 +3,8 @@ import os, sys, random
 from dataclasses import dataclass, field
 from typing import List
 import math
+import logging
+from rich.logging import RichHandler
 
 import torch
 import torch.nn as nn
@@ -26,6 +28,24 @@ from yy_env import (
 from ppo.model import build_actor_and_critic
 from ppo.utils import RolloutBuffer, set_seed
 
+# =═══════════════════════════════════════════════════════════════════════════
+# Set up rich logging
+# ═══════════════════════════════════════════════════════════════════════
+RICH_FORMAT = "[%(filename)s:%(lineno)s] >> %(message)s"
+
+logging.basicConfig(
+    level="INFO",
+    format=RICH_FORMAT,
+    handlers=[RichHandler(rich_tracebacks=True)],
+)
+# Set up rich logging
+logger = logging.getLogger(__name__)
+def handle_exception(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.exit(0)
+    logger.error("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
+    
+sys.excepthook = handle_exception
 
 # ════════════════════════════════════════════════════════════════════════════
 # 1. PPO Configuration with minimal optimizations
@@ -33,7 +53,7 @@ from ppo.utils import RolloutBuffer, set_seed
 @dataclass
 class PPOConfig:
     # LLM / LoRA (unchanged)
-    base_model_name: str = "Qwen/Qwen2.5-Coder-32B-Instruct"
+    base_model_name: str = "Qwen/Qwen2.5-Coder-0.5B-Instruct"
     target_modules: List[str] = field(default_factory=lambda: ["q_proj", "v_proj"])
     lora_r: int = 32
     lora_alpha: int = 64
@@ -42,28 +62,28 @@ class PPOConfig:
     critic_hidden_dims: List[int] = field(default_factory=lambda: [])
 
     # PPO (unchanged)
-    updates: int = 1_000
+    updates: int = 10
     rollout_len: int = 1
     gamma: float = 1.0
     gae_lambda: float = 1.0
-    clip_epsilon: float = 0.05
+    clip_epsilon: float = 0.1
     entropy_coef: float = 0.00
     value_coef: float = 0.5
-    lr: float = 1e-8
-    final_lr: float = 1e-10
+    lr: float = 1e-5
+    final_lr: float = 1e-6
     max_grad_norm: float = 0.5
     
     # Multiple PPO epochs (unchanged)
     ppo_epochs: int = 4
     mini_batch_size: int = 16
-    target_kl: float = 1.0
+    kl_coef: float = 0.2
     
     # Top-K KL divergence settings (unchanged)
-    topk_for_kl: int = 50
-    use_topk_kl: bool = True
+    topk_for_kl: int = 1_000_000
+    use_topk_kl: bool = False
 
     # Environment (unchanged)
-    num_envs: int = 128
+    num_envs: int = 32
     seed: int = 42
     max_problem_length: int = 1024
     max_solution_length: int = 512
@@ -78,12 +98,14 @@ class PPOConfig:
 def check_for_nan_and_abort(tensor, name, step_info=""):
     """Check tensor for NaN and abort if found"""
     if torch.isnan(tensor).any():
-        print(f"❌ NaN detected in {name} at {step_info}")
-        print(f"   Tensor shape: {tensor.shape}")
-        print(f"   Tensor stats: min={tensor.min()}, max={tensor.max()}, mean={tensor.mean()}")
-        print(f"   NaN count: {torch.isnan(tensor).sum()}")
-        print(f"   Inf count: {torch.isinf(tensor).sum()}")
-        print("🚨 ABORTING PROCESS DUE TO NaN")
+        logger.error((
+            f"❌ NaN detected in {name} at {step_info}\n"
+            f"   Tensor shape: {tensor.shape}\n"
+            f"   Tensor stats: min={tensor.min()}, max={tensor.max()}, mean={tensor.mean()}\n"
+            f"   NaN count: {torch.isnan(tensor).sum()}\n"
+            f"   Inf count: {torch.isinf(tensor).sum()}\n"
+            "🚨 ABORTING PROCESS DUE TO NaN"
+        ))
         sys.exit(1)
 
 
@@ -152,16 +174,17 @@ def compute_topk_logprobs_for_sequences_optimized(model, tokenizer, prompts, seq
     available_length = logits.size(1)
     
     if prompt_length >= available_length:
-        print(f"⚠️  Prompt too long ({prompt_length} >= {available_length}), returning zeros")
-        return torch.zeros(sequences.size(0), device=device)
+        # print(f"⚠️  Prompt too long ({prompt_length} >= {available_length}), returning zeros")
+        logger.warning(f"⚠️  Prompt too long ({prompt_length} >= {available_length}), returning zeros")
     
     # Get logits for generated positions
     generated_logits = logits[:, prompt_length-1:-1, :]
     
     min_length = min(generated_tokens.size(1), generated_logits.size(1))
     if min_length == 0:
-        print("⚠️  No generated tokens, returning zeros")
-        return torch.zeros(sequences.size(0), device=device)
+        # print("⚠️  No generated tokens, returning zeros")
+        logger.warning("⚠️  No generated tokens, returning zeros")
+        return torch.zeros(generated_tokens.size(0), device=model_device)
     
     generated_tokens = generated_tokens[:, :min_length]
     generated_logits = generated_logits[:, :min_length, :]
@@ -201,11 +224,8 @@ def compute_topk_logprobs_for_sequences_optimized(model, tokenizer, prompts, seq
     if attention_mask is not None:
         gen_attention_mask = attention_mask[:, prompt_length:prompt_length+min_length]
         token_log_probs = token_log_probs * gen_attention_mask
-        sequence_lengths = gen_attention_mask.sum(dim=-1)
-    else:
-        sequence_lengths = torch.full((batch_size,), min_length, device=model_device)
         
-    sequence_log_probs = token_log_probs.sum(dim=-1) / sequence_lengths.clamp(min=1.0)
+    sequence_log_probs = token_log_probs.sum(dim=-1)
     return sequence_log_probs.to(device)
 
 
@@ -219,8 +239,8 @@ class PPOTrainer:
         set_seed(cfg.seed)
         self.global_step = 0
 
-        print(f"🔧 Using Top-K KL divergence: k={cfg.topk_for_kl}, enabled={cfg.use_topk_kl}")
-        print(f"⚡ Performance optimizations: Mixed Precision={cfg.use_mixed_precision}, Compile={cfg.use_compile}")
+        # print(f"🔧 Using Top-K KL divergence: k={cfg.topk_for_kl}, enabled={cfg.use_topk_kl}")
+        logger.info(f"⚡ Performance optimizations: Mixed Precision={cfg.use_mixed_precision}, Compile={cfg.use_compile}")
 
         # Mixed precision setup
         self.scaler = GradScaler() if cfg.use_mixed_precision else None
@@ -239,7 +259,7 @@ class PPOTrainer:
 
         # PyTorch 2.0 compilation for speed
         if cfg.use_compile and hasattr(torch, 'compile'):
-            print("🚀 Compiling models with torch.compile for speed...")
+            logger.info("🚀 Compiling models with torch.compile for speed...")
             self.actor = torch.compile(self.actor)
             self.critic = torch.compile(self.critic)
 
@@ -299,13 +319,13 @@ class PPOTrainer:
                 eval_window_size=20,
             )
 
-        print(f"🌟 Creating environments with type: {self.cfg.env_type}")
+        logger.info(f"🌟 Creating environments with type: {self.cfg.env_type}")
         
         self.env = create_env(self.cfg.env_type, train_env_cfg, curriculum_cfg)
         self.eval_env = create_env("simple_error", eval_env_cfg)
         self.test_env = create_env("simple_error", test_env_cfg)
         
-        print(f"✅ Environments created successfully!")
+        logger.info(f"✅ Environments created successfully!")
         
     def collect_rollout(self) -> None:
         """Rollout collection with optimizations"""
@@ -321,13 +341,6 @@ class PPOTrainer:
             current_size = end - start
 
             self.env.reset_batch()
-            if len(self.env.batch) > current_size:
-                self.env.batch = self.env.batch[:current_size]
-            
-            if len(self.env.batch) == 0:
-                print(f"⚠️  Empty batch at index {batch_idx}, skipping...")
-                continue
-                
             prompts = [
                 f"Please implement a Python function named `solve(input_str)` that takes the problem input as `input_str` "
                 f"and returns the correct output as a string.\n\nProblem:\n{task['description']}"
@@ -359,7 +372,6 @@ class PPOTrainer:
                         output_hidden_states=True,
                     )
                 
-                current_gpu = gen["sequences"].device
                 last_hidden = outputs.hidden_states[-1][:, -1, :].float()
                 
                 # Check for NaN in hidden states
@@ -393,7 +405,7 @@ class PPOTrainer:
                 # Move to CPU (unchanged)
                 states_cpu = last_hidden.cpu()
                 actions_cpu = gen["sequences"].cpu()
-                logprobs_cpu = gen["logprobs"].cpu() / max(gen["sequences"].size(1) - len(prompts[0].split(" ")), 1)
+                logprobs_cpu = gen["logprobs"].cpu()
                 values_cpu = values.cpu()
                 texts = gen["texts"].copy()
                 
@@ -426,7 +438,7 @@ class PPOTrainer:
         torch.cuda.empty_cache()
 
         if not gpu_data_batches or not all_texts_for_execution:
-            print("❌ No valid batches collected, cannot proceed with rollout")
+            logger.warning("❌ No valid batches collected, cannot proceed with rollout")
             self.last_rewards = torch.zeros(1, dtype=torch.float32, device=self.device)
             return
 
@@ -440,21 +452,20 @@ class PPOTrainer:
         
         # Validate rewards
         if len(all_rewards) != len(all_texts_for_execution):
-            print(f"❌ Reward count mismatch: {len(all_rewards)} rewards for {len(all_texts_for_execution)} texts")
-            if len(all_rewards) < len(all_texts_for_execution):
-                print("⚠️  Padding missing rewards with -1.0")
-                all_rewards.extend([-1.0] * (len(all_texts_for_execution) - len(all_rewards)))
-            else:
-                print("⚠️  Truncating excess rewards")
-                all_rewards = all_rewards[:len(all_texts_for_execution)]
-        
+            logger.error(f"❌ Reward count mismatch: {len(all_rewards)} rewards for {len(all_texts_for_execution)} texts")
+            sys.exit(1)
+            
         all_rewards_tensor = torch.tensor(all_rewards, dtype=torch.float32)
+        all_rewards_tensor = (all_rewards_tensor - all_rewards_tensor.mean()) / (all_rewards_tensor.std() + 1e-8)
         
         # Check for NaN in rewards - ABORT if found
         if torch.isnan(all_rewards_tensor).any():
-            print("❌ NaN detected in rewards from environment")
-            print(f"   Rewards: {all_rewards}")
-            print("🚨 ABORTING PROCESS DUE TO NaN IN REWARDS")
+            logger.error((
+                "❌ NaN detected in rewards from environment\n"
+                f"   Rewards: {all_rewards}\n"
+                "🚨 ABORTING PROCESS DUE TO NaN IN REWARDS"
+            ))
+            
             sys.exit(1)
         
         reward_offset = 0
@@ -468,24 +479,24 @@ class PPOTrainer:
             batch_size = batch_data['batch_size']
             
             if reward_offset + batch_size > len(all_rewards_tensor):
-                print(f"⚠️  Batch {batch_idx}: Not enough rewards remaining.")
+                logger.warning(f"⚠️  Batch {batch_idx}: Not enough rewards remaining.")
                 batch_size = len(all_rewards_tensor) - reward_offset
                 if batch_size <= 0:
-                    print(f"⚠️  Skipping batch {batch_idx}: no rewards remaining")
+                    logger.warning(f"⚠️  Skipping batch {batch_idx}: no rewards remaining")
                     break
             
             batch_rewards = all_rewards_tensor[reward_offset:reward_offset + batch_size]
             reward_offset += batch_size
             
             if len(batch_rewards) == 0:
-                print(f"⚠️  Empty batch_rewards for batch {batch_idx}, skipping")
+                logger.warning(f"⚠️  Empty batch_rewards for batch {batch_idx}, skipping")
                 continue
             
             self.buffer.prompts.extend(batch_data['prompts'][:batch_size])
             
             for i in range(batch_size):
                 if i >= len(batch_rewards):
-                    print(f"⚠️  Index {i} out of bounds for batch_rewards of size {len(batch_rewards)}")
+                    logger.warning(f"⚠️  Index {i} out of bounds for batch_rewards of size {len(batch_rewards)}")
                     break
                     
                 self.buffer.add(
@@ -517,8 +528,10 @@ class PPOTrainer:
         
         # Check advantage statistics for NaN
         if torch.isnan(adv_mean) or torch.isnan(adv_std):
-            print(f"❌ NaN in advantage statistics: mean={adv_mean}, std={adv_std}")
-            print("🚨 ABORTING PROCESS DUE TO NaN IN ADVANTAGE STATISTICS")
+            logger.error((
+                f"❌ NaN in advantage statistics: mean={adv_mean}, std={adv_std}\n"
+                "🚨 ABORTING PROCESS DUE TO NaN IN ADVANTAGE STATISTICS"
+            ))
             sys.exit(1)
         
         # Standard normalization
@@ -568,7 +581,7 @@ class PPOTrainer:
                 mb_indices = indices[start_idx:end_idx]
                 
                 if len(mb_indices) == 0:
-                    print(f"  ⚠️  Skipping empty batch {batch_idx}")
+                    logger.warning(f"  ⚠️  Skipping empty batch {batch_idx}")
                     continue
                 
                 # Extract mini-batch
@@ -595,26 +608,23 @@ class PPOTrainer:
                 
                 # Check losses for NaN - ABORT if found
                 if torch.isnan(policy_loss):
+                    logger.error("❌ NaN in policy loss")
                     sys.exit(1)
                     
                 if torch.isnan(value_loss):
+                    logger.error("❌ NaN in value loss")
                     sys.exit(1)
                     
                 if torch.isnan(entropy):
+                    logger.error("❌ NaN in entropy")
                     sys.exit(1)
-                
-                # Early stopping check
-                if math.isinf(kl_div):
-                    sys.exit(1)
-                elif kl_div > self.cfg.target_kl:
-                    early_stopped = True
-                    break
                 
                 # Compute total loss
                 total_loss = (
                     policy_loss 
                     + self.cfg.value_coef * value_loss 
                     - self.cfg.entropy_coef * entropy
+                    + self.cfg.kl_coef * kl_div
                 )
                 total_loss = torch.clamp(total_loss, min=-5, max=5)
                 
@@ -647,8 +657,12 @@ class PPOTrainer:
                     self.optimizer.step()
                 
                 if torch.isnan(grad_norm) or torch.isinf(grad_norm):
-                    print(f"❌ NaN/Inf gradient norm: {grad_norm} at epoch {epoch}, batch {batch_idx}")
-                    print("🚨 ABORTING PROCESS DUE TO NaN/Inf GRADIENTS")
+                    # print(f"❌ NaN/Inf gradient norm: {grad_norm} at epoch {epoch}, batch {batch_idx}")
+                    # print("🚨 ABORTING PROCESS DUE TO NaN/Inf GRADIENTS")
+                    logger.error((
+                        f"❌ NaN/Inf gradient norm: {grad_norm} at epoch {epoch}, batch {batch_idx}\n"
+                        "🚨 ABORTING PROCESS DUE TO NaN/Inf GRADIENTS"
+                    ))
                     sys.exit(1)
                 
                 # Accumulate statistics
@@ -686,7 +700,7 @@ class PPOTrainer:
             avg_kl_div = total_kl_div / total_batches
             
         else:
-            print("  ⚠️  No batches processed due to early stopping")
+            logger.warning("  ⚠️  No batches processed due to early stopping")
             avg_policy_loss = 0.0
             avg_value_loss = 0.0
             avg_entropy = 0.0
@@ -805,14 +819,18 @@ class PPOTrainer:
         
         # KL divergence validation (unchanged)
         if math.isnan(kl_div):
-            print(f"❌ NaN in KL divergence: {kl_div}")
-            print("🚨 ABORTING PROCESS DUE TO NaN IN KL DIVERGENCE")
+            logger.error((
+                f"❌ NaN in KL divergence: {kl_div}\n"
+                "🚨 ABORTING PROCESS DUE TO NaN IN KL DIVERGENCE"
+            ))
             sys.exit(1)
         
         if math.isinf(kl_div):
-            print(f"❌ Infinite KL divergence: {kl_div}")
-            print("   This shouldn't happen with clamped log ratios!")
-            print("🚨 ABORTING PROCESS DUE TO INFINITE KL")
+            logger.error((
+                f"❌ Infinite KL divergence: {kl_div}\n"
+                "   This shouldn't happen with clamped log ratios!\n"
+                "🚨 ABORTING PROCESS DUE TO INFINITE KL"
+            ))
             sys.exit(1)
         
         kl_div = abs(kl_div)
@@ -879,7 +897,7 @@ class PPOTrainer:
         
         max_seq_length = 2048
         if sequences.size(1) > max_seq_length:
-            print(f"⚠️  Truncating sequences from {sequences.size(1)} to {max_seq_length} tokens")
+            logger.warning(f"⚠️  Truncating sequences from {sequences.size(1)} to {max_seq_length} tokens")
             sequences = sequences[:, :max_seq_length]
             attention_mask = attention_mask[:, :max_seq_length]
         
@@ -887,30 +905,6 @@ class PPOTrainer:
             # Mixed precision forward pass
             if self.cfg.use_mixed_precision:
                 with autocast():
-                    try:
-                        outputs = model(
-                            input_ids=sequences,
-                            attention_mask=attention_mask,
-                            use_cache=False
-                        )
-                        logits = outputs.logits.float()
-                        check_for_nan_and_abort(logits, "model logits", "forward pass")
-                    except torch.cuda.OutOfMemoryError:
-                        print("⚠️  OOM during forward pass, trying with smaller sequences")
-                        max_seq_length = 1024
-                        sequences = sequences[:, :max_seq_length]
-                        attention_mask = attention_mask[:, :max_seq_length]
-                        
-                        outputs = model(
-                            input_ids=sequences,
-                            attention_mask=attention_mask,
-                            use_cache=False
-                        )
-                        logits = outputs.logits.float()
-                        check_for_nan_and_abort(logits, "model logits (after OOM)", "forward pass")
-            else:
-                # Non-mixed precision fallback
-                try:
                     outputs = model(
                         input_ids=sequences,
                         attention_mask=attention_mask,
@@ -918,19 +912,17 @@ class PPOTrainer:
                     )
                     logits = outputs.logits.float()
                     check_for_nan_and_abort(logits, "model logits", "forward pass")
-                except torch.cuda.OutOfMemoryError:
-                    print("⚠️  OOM during forward pass, trying with smaller sequences")
-                    max_seq_length = 1024
-                    sequences = sequences[:, :max_seq_length]
-                    attention_mask = attention_mask[:, :max_seq_length]
                     
-                    outputs = model(
-                        input_ids=sequences,
-                        attention_mask=attention_mask,
-                        use_cache=False
-                    )
-                    logits = outputs.logits.float()
-                    check_for_nan_and_abort(logits, "model logits (after OOM)", "forward pass")
+            else:
+                # Non-mixed precision fallback
+                outputs = model(
+                    input_ids=sequences,
+                    attention_mask=attention_mask,
+                    use_cache=False
+                )
+                logits = outputs.logits.float()
+                check_for_nan_and_abort(logits, "model logits", "forward pass")
+                
         
         # Process in chunks (unchanged logic but with optimizations)
         chunk_size = 512
@@ -958,14 +950,14 @@ class PPOTrainer:
         
         available_length = log_probs.size(1)
         if prompt_length >= available_length:
-            print(f"⚠️  Prompt length {prompt_length} >= available length {available_length}, returning zero log probs")
+            logger.warning(f"⚠️  Prompt length {prompt_length} >= available length {available_length}, returning zero log probs")
             return torch.zeros(sequences.size(0), device=device)
         
         generated_logits = log_probs[:, prompt_length-1:available_length-1, :]
         
         min_length = min(generated_tokens.size(1), generated_logits.size(1))
         if min_length == 0:
-            print("⚠️  No generated tokens to compute log probs for, returning zeros")
+            logger.warning("⚠️  No generated tokens to compute log probs for, returning zeros")
             return torch.zeros(sequences.size(0), device=device)
             
         generated_tokens = generated_tokens[:, :min_length]
@@ -1003,10 +995,17 @@ class PPOTrainer:
             
             # Check computed metrics for NaN
             if math.isnan(pass_rate) or math.isnan(error_rate) or math.isnan(avg_rewards) or math.isnan(positive_rate):
-                print(f"❌ NaN in computed metrics at update {upd}")
-                print(f"   pass_rate: {pass_rate}, error_rate: {error_rate}")
-                print(f"   avg_rewards: {avg_rewards}, positive_rate: {positive_rate}")
-                print("🚨 ABORTING PROCESS DUE TO NaN IN METRICS")
+                # print(f"❌ NaN in computed metrics at update {upd}")
+                # print(f"   pass_rate: {pass_rate}, error_rate: {error_rate}")
+                # print(f"   avg_rewards: {avg_rewards}, positive_rate: {positive_rate}")
+                # print("🚨 ABORTING PROCESS DUE TO NaN IN METRICS")
+                logger.error((
+                    f"x❌ NaN in computed metrics at update {upd}\n"
+                    f"  pass_rate: {pass_rate}, error_rate: {error_rate}\n"
+                    f"  avg_rewards: {avg_rewards}, positive_rate: {positive_rate}\n"
+                    "🚨 ABORTING PROCESS DUE TO NaN IN METRICS"
+                ))
+                    
                 sys.exit(1)
             
             # Record performance for curriculum
@@ -1027,20 +1026,16 @@ class PPOTrainer:
                 "train/pass_rate": pass_rate,
                 "train/error_rate": error_rate,
                 "train/positive_rate": positive_rate,
-                "train/env_type": self.cfg.env_type,
-                "train/topk_kl_enabled": self.cfg.use_topk_kl,
                 "train/topk_kl_k": self.cfg.topk_for_kl,
-                # Performance metrics
-                "optimization/mixed_precision": self.cfg.use_mixed_precision,
-                "optimization/torch_compile": self.cfg.use_compile,
-                "optimization/cache_hit_rate": len(self.tokenize_cache.cache) / max(self.global_step, 1),
             }
 
             # Check all log values for NaN
             for key, value in log_data.items():
                 if isinstance(value, float) and math.isnan(value):
-                    print(f"❌ NaN in log data: {key} = {value}")
-                    print("🚨 ABORTING PROCESS DUE TO NaN IN LOG DATA")
+                    logger.error((
+                        f"❌ NaN in log data: {key} = {value}\n"
+                        "🚨 ABORTING PROCESS DUE TO NaN IN LOG DATA"
+                    ))
                     sys.exit(1)
 
             # Add curriculum status if available
@@ -1094,8 +1089,12 @@ class PPOTrainer:
                 # Check for NaN in evaluation rewards
                 for j, r in enumerate(rewards):
                     if isinstance(r, float) and math.isnan(r):
-                        print(f"❌ NaN in evaluation reward at batch {i}, sample {j}: {r}")
-                        print("🚨 ABORTING PROCESS DUE TO NaN IN EVALUATION REWARDS")
+                        # print(f"❌ NaN in evaluation reward at batch {i}, sample {j}: {r}")
+                        # print("🚨 ABORTING PROCESS DUE TO NaN IN EVALUATION REWARDS")
+                        logger.error((
+                            f"❌ NaN in evaluation reward at batch {i}, sample {j}: {r}\n"
+                            "🚨 ABORTING PROCESS DUE TO NaN IN EVALUATION REWARDS"
+                        ))
                         sys.exit(1)
                 
                 total_reward += sum(rewards)
@@ -1114,8 +1113,12 @@ class PPOTrainer:
         
         # Check final evaluation results for NaN
         if math.isnan(avg_reward) or math.isnan(pass_rate):
-            print(f"❌ NaN in evaluation results: avg_reward={avg_reward}, pass_rate={pass_rate}")
-            print("🚨 ABORTING PROCESS DUE TO NaN IN EVALUATION RESULTS")
+            # print(f"❌ NaN in evaluation results: avg_reward={avg_reward}, pass_rate={pass_rate}")
+            # print("🚨 ABORTING PROCESS DUE TO NaN IN EVALUATION RESULTS")
+            logger.error((
+                f"❌ NaN in evaluation results: avg_reward={avg_reward}, pass_rate={pass_rate}\n"
+                "🚨 ABORTING PROCESS DUE TO NaN IN EVALUATION RESULTS"
+            ))
             sys.exit(1)
             
         return avg_reward, pass_rate
@@ -1181,9 +1184,9 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     
-    print(f"🚀 Starting optimized PPO training")
-    print(f"📊 Environment type: {args.env_type}")
-    print(f"🔧 Top-K KL: k={args.topk_kl}, enabled={not args.disable_topk_kl}")
+    logger.info(f"🚀 Starting optimized PPO training")
+    logger.info(f"📊 Environment type: {args.env_type}")
+    logger.info(f"🔧 Top-K KL: k={args.topk_kl}, enabled={not args.disable_topk_kl}")
     
     # Create configuration
     cfg = PPOConfig()
@@ -1201,22 +1204,22 @@ if __name__ == "__main__":
     if args.lr is not None:
         cfg.lr = args.lr
     
-    print(f"🔧 Settings:")
-    print(f"  Environment: {cfg.env_type}")
-    print(f"  PPO epochs: {cfg.ppo_epochs}")
-    print(f"  Updates: {cfg.updates}")
-    print(f"  Learning rate: {cfg.lr}")
-    print(f"  Top-K for KL: {cfg.topk_for_kl}")
-    print(f"  Use Top-K KL: {cfg.use_topk_kl}")
-    print(f"  Target KL: {cfg.target_kl}")
-    print(f"  Mixed Precision: {cfg.use_mixed_precision}")
-    print(f"  Torch Compile: {cfg.use_compile}")
-    print(f"  Cleanup Frequency: {cfg.cleanup_frequency}")
+    logger.info((f"🔧 Settings:\n"
+        f"  Environment: {cfg.env_type}\n"
+        f"  PPO epochs: {cfg.ppo_epochs}\n"
+        f"  Updates: {cfg.updates}\n"
+        f"  Learning rate: {cfg.lr}\n"
+        f"  Top-K for KL: {cfg.topk_for_kl}\n"
+        f"  Use Top-K KL: {cfg.use_topk_kl}\n"
+        f"  Mixed Precision: {cfg.use_mixed_precision}\n"
+        f"  Torch Compile: {cfg.use_compile}\n"
+        f"  Cleanup Frequency: {cfg.cleanup_frequency}"
+    ))
     
     # Create and run trainer
     trainer = PPOTrainer(cfg)
     trainer.train()
     trainer.test()
     
-    print(f"✅ Training completed successfully!")
-    print(f"📊 Final statistics: {trainer.total_updates} updates completed")
+    logger.info(f"✅ Training completed successfully!")
+    logger.info(f"📊 Final statistics: {trainer.total_updates} updates completed")
