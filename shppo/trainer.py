@@ -3,7 +3,7 @@ import os
 import sys
 import time
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, List, Any, Optional, Tuple
 from collections import defaultdict
 
@@ -39,8 +39,8 @@ type_act = Dict[str, str]
 class SHPPOConfig:
     # Environment
     env_config: EnvConfig = field(default_factory=lambda: EnvConfig(
-        max_problems=100,
-        batch_size=4
+        max_problems=512,
+        batch_size=64
     ))
     
     # Model
@@ -64,7 +64,7 @@ class SHPPOConfig:
     # Training
     n_episodes: int = 100
     n_epochs: int = 4
-    mini_batch_size: int = 2
+    mini_batch_size: int = 128
     
     # Separate Learning Rates for Each Component
     lr_actor: float = 3e-4
@@ -117,7 +117,16 @@ class CompleteSHPPOTrainer:
         self._setup_logging()
         
         # Create environment using yy_env
-        self.env = create_env("simple_simple", self.cfg.env_config)
+        self.env = create_env("curriculum_error", self.cfg.env_config)
+        # Evaluation and test environments, with batch size set to training batch size
+        self.eval_env = create_env(
+            "curriculum_error",
+            replace(self.cfg.env_config, split="valid", batch_size=self.cfg.env_config.batch_size)
+        )
+        self.test_env = create_env(
+            "curriculum_error",
+            replace(self.cfg.env_config, split="test", batch_size=self.cfg.env_config.batch_size)
+        )
         
         self._build_models()
         self._setup_optimizers()
@@ -305,12 +314,119 @@ class CompleteSHPPOTrainer:
     def _generate_content(self, role: str, action_idx: int, latent: torch.Tensor) -> str:
         """Generate content using enhanced LLM with latent conditioning"""
         return self.llm.generate_with_latent_conditioning(role, action_idx, latent)
+    
+    def _log_generated_samples(self, episode: int, batch_solutions: List[str], obs_batch: List, rewards: List[float]):
+        """Log generated code samples to WandB with full content in markdown format"""
+        
+        # 너무 자주 로깅하면 느려지므로 간격 조절
+        if episode % self.cfg.log_interval != 0:
+            return
+        
+        # 처음 몇 개 샘플만 로깅 (전체 배치는 너무 많음)
+        n_samples = min(3, len(batch_solutions))
+        
+        table_data = []
+        
+        for i in range(n_samples):
+            problem = obs_batch[i]
+            solution = batch_solutions[i]
+            reward = rewards[i]
+            
+            # 문제 설명을 마크다운 형식으로 포맷팅 (전체 내용 유지)
+            problem_description = f"```markdown\n{problem.get('description', 'No description')}\n```"
+            
+            # 생성된 코드를 마크다운 형식으로 포맷팅 (전체 내용 유지)
+            generated_code = f"```python\n{solution}\n```"
+            
+            # 테이블에 전체 내용 추가
+            table_data.append([
+                episode,
+                problem.get('name', f'Problem_{i}'),
+                problem_description,  # 전체 내용, 마크다운 형식
+                generated_code,       # 전체 내용, 마크다운 형식
+                round(reward, 4),
+                'Pass' if reward >= 0.5 else 'Fail',
+                len(solution)
+            ])
+        
+        # WandB에 로깅 - 테이블만 사용
+        if table_data:
+            # 코드 샘플 테이블 (전체 내용 포함)
+            samples_table = wandb.Table(
+                columns=["Episode", "Problem", "Description", "Generated_Code", "Reward", "Status", "Code_Length"],
+                data=table_data
+            )
+            wandb.log({"code_samples_table": samples_table}, step=episode)
+            
+            # 요약 통계만 별도로
+            wandb.log({
+                "batch_avg_reward": sum(rewards) / len(rewards),
+                "batch_pass_rate": sum(1 for r in rewards if r >= 0.5) / len(rewards),
+                "batch_avg_code_length": sum(len(code) for code in batch_solutions) / len(batch_solutions),
+                "batch_total_samples": len(batch_solutions)
+            }, step=episode)
+
+    def _log_role_based_samples(self, episode: int, workspace_history: List[Dict]):
+        """Log role-based generation results with full content in markdown format"""
+        
+        if episode % (self.cfg.log_interval * 2) != 0:  # 덜 자주 로깅
+            return
+        
+        # 첫 번째 문제의 역할별 결과만 로깅 (예시용)
+        if not workspace_history:
+            return
+            
+        sample_workspace = workspace_history[0]
+        
+        role_outputs = {}
+        for filename, content in sample_workspace.items():
+            if filename == "problem.md":
+                continue
+            elif filename == "plan.md":
+                role_outputs["planner"] = content
+            elif filename == "code.py":
+                role_outputs["coder"] = content
+            elif filename == "fixed_code.py":
+                role_outputs["debugger"] = content
+        
+        if not role_outputs:  # 역할 출력이 없으면 리턴
+            return
+        
+        # 역할별 결과를 테이블로 로깅 (전체 내용 포함)
+        role_table_data = []
+        
+        for role, content in role_outputs.items():
+            # 역할에 따른 마크다운 형식 선택 (전체 내용 유지)
+            if role == "planner":
+                display_content = f"```markdown\n{content}\n```"
+            else:
+                display_content = f"```python\n{content}\n```"
+            
+            role_table_data.append([
+                episode,
+                role.title(),
+                display_content,  # 전체 내용, 마크다운 형식
+                len(content)      # 내용 길이 추가
+            ])
+        
+        # WandB에 테이블로 로깅 (전체 내용 포함)
+        if role_table_data:
+            role_table = wandb.Table(
+                columns=["Episode", "Role", "Generated_Content", "Content_Length"],
+                data=role_table_data
+            )
+            wandb.log({
+                "role_based_table": role_table,
+                "total_roles": len(role_outputs)
+            }, step=episode)
         
     def _run_episode(self) -> Dict[str, float]:
-        """Run one complete episode"""
+        """Run one complete episode - MODIFIED to support logging"""
         
         # Reset environment and get batch of problems
         obs_batch = self.env.reset_batch()
+        assert len(obs_batch) == self.cfg.env_config.batch_size, \
+            f"Expected batch size {self.cfg.env_config.batch_size}, got {len(obs_batch)}"
         
         episode_reward = 0.0
         episode_length = 0
@@ -328,19 +444,25 @@ class CompleteSHPPOTrainer:
         
         # Generate solutions for each problem in the batch
         batch_solutions = []
+        workspace_history = []  # 역할별 로깅을 위해 추가
         
         for batch_idx, problem in enumerate(obs_batch):
-            # self.console.print(f"[blue]🔧 Processing problem {batch_idx + 1}/{len(obs_batch)}: {problem.get('name', 'Unknown')}[/blue]")
-            
             # Generate solution for this problem using multi-agent workflow
-            solution = self._generate_solution_for_problem(problem, episode_latent_data)
+            solution, workspace = self._generate_solution_for_problem(problem, episode_latent_data)
             batch_solutions.append(solution)
+            workspace_history.append(workspace["visible_files"])  # 워크스페이스 히스토리 저장
             
             episode_length += 3  # planner, coder, debugger
             self.step += 1
-        
+        torch.cuda.empty_cache()  # Clear cache after generating solutions
         # Submit all solutions to environment at once
         rewards = self.env.step_batch(batch_solutions)
+        assert len(rewards) == self.cfg.env_config.batch_size, \
+            f"Expected batch size {self.cfg.env_config.batch_size}, got {len(rewards)}"
+        
+        # 🎯 코드 샘플 로깅!
+        self._log_generated_samples(self.episode, batch_solutions, obs_batch, rewards)
+        self._log_role_based_samples(self.episode, workspace_history)
         
         # Calculate episode metrics
         episode_reward = sum(rewards) / len(rewards)
@@ -348,9 +470,10 @@ class CompleteSHPPOTrainer:
         
         # Distribute rewards to trajectories
         self._distribute_rewards_to_trajectories(rewards)
-        
+        torch.cuda.empty_cache()  # Clear cache after reward distribution
         # Compute GAE for all roles
         self._compute_gae()
+        torch.cuda.empty_cache()
         
         return {
             "episode_reward": episode_reward,
@@ -359,8 +482,8 @@ class CompleteSHPPOTrainer:
             "latent_data": episode_latent_data
         }
     
-    def _generate_solution_for_problem(self, problem: Dict[str, Any], episode_latent_data: List) -> str:
-        """Generate solution for a single problem using multi-agent workflow - FIXED"""
+    def _generate_solution_for_problem(self, problem: Dict[str, Any], episode_latent_data: List) -> Tuple[str, Dict]:
+        """Generate solution for a single problem using multi-agent workflow - MODIFIED to return workspace"""
         
         # Initialize problem workspace
         workspace = {
@@ -425,8 +548,8 @@ class CompleteSHPPOTrainer:
                 'obs_emb': obs_emb.detach().to(device)
             })
         
-        # Return the final code solution
-        return workspace["visible_files"]["code.py"]
+        # Return the final code solution AND workspace
+        return workspace["visible_files"]["code.py"], workspace
     
     def _distribute_rewards_to_trajectories(self, rewards: List[float]):
         """Distribute batch rewards to individual trajectories"""
@@ -853,6 +976,17 @@ class CompleteSHPPOTrainer:
                     log_data[f"train/{k}"] = v
                 
                 wandb.log(log_data, step=episode)
+
+                # --- Validation ---
+                if episode % self.cfg.eval_interval == 0:
+                    val_batch = self.eval_env.reset_batch()
+                    val_sols = []
+                    for problem in val_batch:
+                        sol, _ = self._generate_solution_for_problem(problem, [])
+                        val_sols.append(sol)
+                    val_rewards = self.eval_env.step_batch(val_sols)
+                    val_reward = sum(val_rewards) / len(val_rewards) if val_rewards else 0.0
+                    wandb.log({"eval/episode_reward": val_reward}, step=episode)
                 
                 # Update progress bar
                 progress.update(
@@ -875,6 +1009,17 @@ class CompleteSHPPOTrainer:
             f"• Best reward: {self.best_reward:.4f}",
             title="Training Complete"
         ))
+
+        # --- Final test ---
+        test_batch = self.test_env.reset_batch()
+        test_sols = []
+        for problem in test_batch:
+            sol, _ = self._generate_solution_for_problem(problem, [])
+            test_sols.append(sol)
+        test_rewards = self.test_env.step_batch(test_sols)
+        test_reward = sum(test_rewards) / len(test_rewards) if test_rewards else 0.0
+        self.console.print(f"[bold blue]🔍 Test Reward: {test_reward:.4f}[/bold blue]")
+        wandb.log({"test/episode_reward": test_reward})
         wandb.finish()
     
     def _log_episode_details(self, episode: int, reward: float, pass_rate: float, losses: Dict[str, float]):
@@ -944,21 +1089,8 @@ def main():
     
     console = Console()
     
-    parser = argparse.ArgumentParser(description="Complete SHPPO Training")
-    parser.add_argument("--episodes", type=int, default=100, help="Number of episodes")
-    parser.add_argument("--device", type=str, default="auto", help="Training device")
-    parser.add_argument("--wandb_project", type=str, default="shppo-complete", help="WandB project name")
-    parser.add_argument("--batch_size", type=int, default=4, help="Environment batch size")
-    args = parser.parse_args()
-    
     # Create config
     config = SHPPOConfig()
-    config.n_episodes = args.episodes
-    config.wandb_project = args.wandb_project
-    config.env_config.batch_size = args.batch_size
-    
-    if args.device != "auto":
-        config.device = args.device
     
     # Display startup info
     console.print(Panel(
