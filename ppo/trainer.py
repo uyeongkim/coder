@@ -32,7 +32,7 @@ from ppo.utils import RolloutBuffer, set_seed, check_for_nan_and_abort, SimpleCa
 # =═══════════════════════════════════════════════════════════════════════════logger, 
 # Set up rich logging
 # ═══════════════════════════════════════════════════════════════════════
-RICH_FORMAT = "[%(filename)s:%(lineno)s] >> %(message)s"
+RICH_FORMAT = "%(message)s"
 
 logging.basicConfig(
     level="INFO",
@@ -55,7 +55,7 @@ sys.excepthook = handle_exception
 class PPOConfig:
     # LLM / LoRA (unchanged)
     base_model_name: str = "Qwen/Qwen2.5-Coder-0.5B-Instruct"
-    target_modules: List[str] = field(default_factory=lambda: ["q_proj", "v_proj"])
+    target_modules: List[str] = field(default_factory=lambda: ["q_proj", "v_proj", "k_proj", "o_proj"])
     lora_r: int = 16
     lora_alpha: int = 32
 
@@ -63,23 +63,23 @@ class PPOConfig:
     critic_hidden_dims: List[int] = field(default_factory=lambda: [])
 
     # PPO (unchanged)
-    updates: int = 1000
+    updates: int = 500
     rollout_len: int = 1
     gamma: float = 1.0
     gae_lambda: float = 1.0
-    clip_epsilon: float = 0.1
+    clip_epsilon: float = 0.05
     entropy_coef: float = 0.0
     value_coef: float = 0.5
-    lr: float = 1e-5
-    final_lr: float = 1e-6
+    lr: float = 1e-6
+    final_lr: float = 1e-7
     max_grad_norm: float = 0.5
     warmup_ratio: float = 0.01  # Warmup ratio for learning rate schedule
     
     # Multiple PPO epochs (unchanged)
     ppo_epochs: int = 1
-    mini_batch_size: int = 32
-    grad_acc: int = 16  # Gradient accumulation steps
-    kl_coef: float = 0.5
+    mini_batch_size: int = 16
+    grad_acc: int = 32  # Gradient accumulation steps
+    kl_coef: float = 1.0
     
     # Top-K KL divergence settings (unchanged)
     topk_for_kl: int = 1_000_000
@@ -88,7 +88,7 @@ class PPOConfig:
     # Environment (unchanged)
     num_envs: int = 512
     seed: int = 42
-    max_problem_length: int = 1024
+    max_problem_length: int = 2048
     max_solution_length: int = 512
     env_type: str = "curriculum_error"
     
@@ -258,7 +258,7 @@ class PPOTrainer:
     def _setup_environments(self):
         """Setup environments (unchanged)"""
         train_env_cfg = EnvConfig(
-            batch_size=32,
+            batch_size=50,
             max_problem_length=self.cfg.max_problem_length,
             max_solution_length=self.cfg.max_solution_length,
             max_problems=100_000,
@@ -284,9 +284,9 @@ class PPOTrainer:
         curriculum_cfg = None
         if "curriculum" in self.cfg.env_type:
             curriculum_cfg = CurriculumConfig(
-                pass_rate_threshold=0.05,
-                avg_reward_threshold=0.0,
-                min_episodes_per_level=50,
+                pass_rate_threshold=0.1,
+                avg_reward_threshold=0.5,
+                min_episodes_per_level=20,
                 eval_window_size=20,
             )
 
@@ -618,6 +618,8 @@ class PPOTrainer:
                         )
                         if not torch.isfinite(grad_norm):
                             logger.warning(f"⚠️ Non-finite grad norm: {grad_norm} — skipping update")
+                            # Reset scaler state to allow subsequent unscale calls
+                            self.scaler.update()
                             self.optimizer.zero_grad(set_to_none=True)
                             return
                         self.scaler.step(self.optimizer)
@@ -979,19 +981,35 @@ class PPOTrainer:
                 self.env.record_episode_performance(avg_rewards, pass_rate)
 
             # Logging with performance metrics
-            log_data = {
-                "train/step": self.global_step,
-                "train/lr": self.optimizer.param_groups[0]['lr'],
-                "train/policy_loss": update_info['policy_loss'],
-                "train/value_loss": update_info['value_loss'],
-                "train/entropy": update_info['entropy'],
-                "train/kl_divergence": update_info['kl_divergence'],
-                "train/early_stopped": update_info['early_stopped'],
-                "train/average_reward": avg_rewards,
-                "train/pass_rate": pass_rate,
-                "train/error_rate": error_rate,
-                "train/positive_rate": positive_rate,
-            }
+            if update_info is None:
+                logger.warning(f"⚠️  Update {upd} returned None, skipping logging")
+                log_data = {
+                    "train/step": self.global_step,
+                    "train/lr": self.optimizer.param_groups[0]['lr'],
+                    "train/policy_loss": 0.0,
+                    "train/value_loss": 0.0,
+                    "train/entropy": 0.0,
+                    "train/kl_divergence": 0.0,
+                    "train/early_stopped": False,
+                    "train/average_reward": avg_rewards,
+                    "train/pass_rate": pass_rate,
+                    "train/error_rate": error_rate,
+                    "train/positive_rate": positive_rate,
+                }
+            else:
+                log_data = {
+                    "train/step": self.global_step,
+                    "train/lr": self.optimizer.param_groups[0]['lr'],
+                    "train/policy_loss": update_info['policy_loss'],
+                    "train/value_loss": update_info['value_loss'],
+                    "train/entropy": update_info['entropy'],
+                    "train/kl_divergence": update_info['kl_divergence'],
+                    "train/early_stopped": update_info['early_stopped'],
+                    "train/average_reward": avg_rewards,
+                    "train/pass_rate": pass_rate,
+                    "train/error_rate": error_rate,
+                    "train/positive_rate": positive_rate,
+                }
 
             # Check all log values for NaN
             for key, value in log_data.items():

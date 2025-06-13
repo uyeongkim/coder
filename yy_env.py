@@ -21,7 +21,28 @@ from datasets import load_dataset
 import functools
 import hashlib
 import signal
+import logging
+from rich.logging import RichHandler
 
+
+# =═══════════════════════════════════════════════════════════════════════════logger, 
+# Set up rich logging
+# ═══════════════════════════════════════════════════════════════════════
+RICH_FORMAT = "%(message)s"
+
+logging.basicConfig(
+    level="INFO",
+    format=RICH_FORMAT,
+    handlers=[RichHandler(rich_tracebacks=True)],
+)
+# Set up rich logging
+logger = logging.getLogger(__name__)
+def handle_exception(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.exit(0)
+    logger.error("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
+    
+sys.excepthook = handle_exception
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 1. Base Configuration
@@ -93,7 +114,7 @@ class CodeContestDataset:
         self._load_dataset()
 
     def _load_dataset(self):
-        print(f"🔄 Loading {self.cfg.split} dataset with optimizations...")
+        logger.info(f"🔄 Loading {self.cfg.split} dataset with optimizations...")
         
         ds = load_dataset(
             "deepmind/code_contests",
@@ -115,7 +136,7 @@ class CodeContestDataset:
                 self.tasks.append(task)
         
         random.shuffle(self.tasks)
-        print(f"✅ Loaded {len(self.tasks)} tasks")
+        logger.info(f"✅ Loaded {len(self.tasks)} tasks")
 
     def _is_valid_task(self, row) -> bool:
         """Fast validation check"""
@@ -167,7 +188,7 @@ class CodeContestDataset:
             
             return task
         except Exception as e:
-            print(f"⚠️  Error processing task: {e}")
+            logging.error(f"⚠️  Error processing task: {e}")
             return None
 
     def _compute_task_hash(self, task: Dict[str, Any]) -> str:
@@ -338,7 +359,7 @@ class SafeCodeExecutor:
                 results = [future.result() for future in futures]
             return results
         except Exception as e:
-            print(f"⚠️  Parallel execution failed: {e}, falling back to sequential")
+            logger.warning(f"⚠️  Parallel execution failed: {e}, falling back to sequential")
             return [
                 SafeCodeExecutor.execute_code_safely(code, inp, timeout)
                 for code, inp, timeout in tasks
@@ -595,11 +616,15 @@ class CurriculumManager:
         # Categorize problems by difficulty
         self.problems_by_difficulty = self._categorize_problems(problems)
         
-        print(f"📚 Curriculum Learning initialized:")
-        print(f"  Easy: {len(self.problems_by_difficulty[DifficultyLevel.EASY])}")
-        print(f"  Medium: {len(self.problems_by_difficulty[DifficultyLevel.MEDIUM])}")  
-        print(f"  Hard: {len(self.problems_by_difficulty[DifficultyLevel.HARD])}")
-        print(f"  Starting with: {self.current_level.value}")
+        logger.info((
+            f"📚 Curriculum Learning initialized:\n"
+            f"  Easy: {len(self.problems_by_difficulty[DifficultyLevel.EASY])}\n"
+            f"  Medium: {len(self.problems_by_difficulty[DifficultyLevel.MEDIUM])}\n"
+            f"  Hard: {len(self.problems_by_difficulty[DifficultyLevel.HARD])}\n"
+            f"  Starting with: {self.current_level.value}"
+        ))
+        
+        
     
     def _categorize_problems(self, problems: List[Dict[str, Any]]) -> Dict[DifficultyLevel, List[Dict[str, Any]]]:
         """Problem categorization with caching"""
@@ -725,10 +750,12 @@ class CurriculumManager:
         
         self.episodes_at_current_level = 0
         
-        print(f"\n🏆 CURRICULUM ADVANCED! 🏆")
-        print(f"Progression: {old_level.value} → {self.current_level.value}")
-        print(f"New challenge set: {len(self.problems_by_difficulty[self.current_level])} problems")
-        print("="*50)
+        logger.info((
+            f"🏆 CURRICULUM ADVANCED! 🏆\n"
+            f"Progression: {old_level.value} → {self.current_level.value}\n"
+            f"New challenge set: {len(self.problems_by_difficulty[self.current_level])} problems"
+        ))
+
     
     def get_status(self) -> Dict[str, Any]:
         """Get status"""
@@ -793,7 +820,7 @@ class BaseCodeEnv:
                     ]
                     rewards = [future.result() for future in tqdm(futures, desc="Evaluating Batch", leave=False)]
             except Exception as e:
-                print(f"⚠️  Parallel reward calculation failed: {e}, falling back to sequential")
+                logger.warning(f"⚠️  Parallel reward calculation failed: {e}, falling back to sequential")
                 rewards = [
                     self.reward_calculator.calculate_reward(task, sol)
                     for task, sol in tqdm(list(zip(self.batch, solutions)), desc="Evaluating Batch", leave=False)
@@ -863,7 +890,7 @@ class CurriculumCodeEnv(BaseCodeEnv):
         current_problems = self.curriculum_manager.get_current_problems()
         
         if not current_problems:
-            print(f"⚠️  No problems available for current level, using all problems")
+            logger.warning(f"⚠️  No problems available for current level, using all problems")
             current_problems = self.dataset
         
         batch_size = min(self.cfg.batch_size, len(current_problems))
@@ -982,259 +1009,3 @@ def create_optimized_env_config(
         cache_extracted_functions=True,
         precompute_test_hashes=False  # Skip for speed
     )
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 8. Performance Monitoring and Benchmarking
-# ═══════════════════════════════════════════════════════════════════════════
-class PerformanceMonitor:
-    """Monitor environment performance and provide optimization suggestions"""
-    
-    def __init__(self):
-        self.execution_times = []
-        self.cache_hits = 0
-        self.cache_misses = 0
-        self.parallel_speedups = []
-    
-    def record_execution_time(self, time_seconds: float):
-        """Record execution time for performance tracking"""
-        self.execution_times.append(time_seconds)
-    
-    def record_cache_hit(self):
-        """Record cache hit"""
-        self.cache_hits += 1
-    
-    def record_cache_miss(self):
-        """Record cache miss"""
-        self.cache_misses += 1
-    
-    def record_parallel_speedup(self, sequential_time: float, parallel_time: float):
-        """Record parallel vs sequential performance"""
-        if parallel_time > 0:
-            speedup = sequential_time / parallel_time
-            self.parallel_speedups.append(speedup)
-    
-    def get_performance_report(self) -> Dict[str, Any]:
-        """Get comprehensive performance report"""
-        if not self.execution_times:
-            return {"status": "No data collected yet"}
-        
-        avg_execution_time = sum(self.execution_times) / len(self.execution_times)
-        total_cache_requests = self.cache_hits + self.cache_misses
-        cache_hit_rate = self.cache_hits / max(total_cache_requests, 1)
-        
-        avg_speedup = sum(self.parallel_speedups) / max(len(self.parallel_speedups), 1)
-        
-        return {
-            "avg_execution_time_seconds": avg_execution_time,
-            "cache_hit_rate": cache_hit_rate,
-            "cache_hits": self.cache_hits,
-            "cache_misses": self.cache_misses,
-            "avg_parallel_speedup": avg_speedup,
-            "total_executions": len(self.execution_times),
-            "total_parallel_comparisons": len(self.parallel_speedups)
-        }
-    
-    def get_optimization_suggestions(self) -> List[str]:
-        """Get optimization suggestions based on performance data"""
-        suggestions = []
-        
-        if not self.execution_times:
-            return ["Collect performance data first by running some environments"]
-        
-        cache_hit_rate = self.cache_hits / max(self.cache_hits + self.cache_misses, 1)
-        
-        if cache_hit_rate < 0.3:
-            suggestions.append("Cache hit rate is low. Consider increasing cache size or improving cache key strategy.")
-        
-        if self.parallel_speedups and sum(self.parallel_speedups) / len(self.parallel_speedups) < 1.5:
-            suggestions.append("Parallel execution shows limited speedup. Consider optimizing task granularity or checking CPU utilization.")
-        
-        avg_time = sum(self.execution_times) / len(self.execution_times)
-        if avg_time > 5.0:
-            suggestions.append("Average execution time is high. Consider reducing test case count or optimizing code execution.")
-        
-        if not suggestions:
-            suggestions.append("Performance looks good! Environment is well optimized.")
-        
-        return suggestions
-
-
-# Global performance monitor instance
-_performance_monitor = PerformanceMonitor()
-
-def get_performance_monitor() -> PerformanceMonitor:
-    """Get global performance monitor instance"""
-    return _performance_monitor
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 9. Usage Examples & Testing
-# ═══════════════════════════════════════════════════════════════════════════
-if __name__ == "__main__":
-    import time
-    
-    print("🧪 Testing environment performance...")
-    print("="*60)
-    
-    # Test performance comparison
-    def benchmark_environments():
-        """Benchmark standard vs optimized execution"""
-        
-        # Standard config
-        standard_cfg = EnvConfig(
-            batch_size=4, 
-            max_problems=50, 
-            split="train",
-            use_parallel_execution=False,
-            cache_extracted_functions=False
-        )
-        
-        # Optimized config
-        optimized_cfg = EnvConfig(
-            batch_size=4, 
-            max_problems=50, 
-            split="train",
-            use_parallel_execution=True,
-            cache_extracted_functions=True,
-            max_workers=4
-        )
-        
-        environments = [
-            ("simple_error_standard", standard_cfg),
-            ("simple_error_optimized", optimized_cfg)
-        ]
-        
-        results = {}
-        
-        for env_name, cfg in environments:
-            print(f"\n🔬 Testing: {env_name}")
-            
-            start_time = time.time()
-            
-            # Create environment
-            env = create_env("simple_error", cfg)
-            
-            # Test with dummy solutions
-            env.reset_batch()
-            dummy_solutions = [
-                "def solve(input_str):\n    return '1'",
-                "def solve(input_str):\n    lines = input_str.strip().split('\\n')\n    return str(len(lines))",
-                "def solve(input_str):\n    return input_str.strip()",
-                "def solve(input_str):\n    return 'test'"
-            ] * (len(env.batch) // 4 + 1)
-            dummy_solutions = dummy_solutions[:len(env.batch)]
-            
-            # Execute and time
-            execution_start = time.time()
-            rewards = env.step_batch(dummy_solutions)
-            execution_time = time.time() - execution_start
-            
-            total_time = time.time() - start_time
-            
-            results[env_name] = {
-                "total_time": total_time,
-                "execution_time": execution_time,
-                "batch_size": len(env.batch),
-                "avg_reward": sum(rewards) / len(rewards) if rewards else 0,
-                "performance_stats": env.get_performance_stats()
-            }
-            
-            print(f"  Total time: {total_time:.2f}s")
-            print(f"  Execution time: {execution_time:.2f}s")
-            print(f"  Batch size: {len(env.batch)}")
-            print(f"  Sample rewards: {rewards[:3]}...")
-        
-        # Performance comparison
-        if len(results) >= 2:
-            standard_time = results["simple_error_standard"]["execution_time"]
-            optimized_time = results["simple_error_optimized"]["execution_time"]
-            
-            if optimized_time > 0:
-                speedup = standard_time / optimized_time
-                print(f"\n⚡ Performance improvement: {speedup:.2f}x faster")
-                print(f"   Standard execution: {standard_time:.2f}s")
-                print(f"   Optimized execution: {optimized_time:.2f}s")
-            else:
-                print(f"\n⚠️  Unable to calculate speedup (optimized time: {optimized_time})")
-        
-        return results
-    
-    # Test all 4 combinations
-    def test_all_environments():
-        """Test all environment combinations"""
-        cfg = create_optimized_env_config(batch_size=3, max_problems=20, split="train")
-        
-        environments = [
-            "simple_simple",
-            "simple_error", 
-            "curriculum_simple",
-            "curriculum_error"
-        ]
-        
-        print("\n🧪 Testing all environment combinations:")
-        print("="*50)
-        
-        for env_name in environments:
-            print(f"\n🧪 Testing: {env_name}")
-            
-            try:
-                # Create environment
-                env = create_env(env_name, cfg)
-                
-                # Test with dummy solutions
-                env.reset_batch()
-                dummy_solutions = ["def solve(input_str): return '1'"] * len(env.batch)
-                
-                start_time = time.time()
-                rewards = env.step_batch(dummy_solutions)
-                execution_time = time.time() - start_time
-                
-                print(f"  Batch size: {len(env.batch)}")
-                print(f"  Execution time: {execution_time:.2f}s")
-                print(f"  Sample rewards: {rewards[:3] if len(rewards) >= 3 else rewards}")
-                print(f"  Performance stats: {env.get_performance_stats()}")
-                
-                # Test curriculum status if applicable
-                if hasattr(env, 'get_curriculum_status'):
-                    print(f"  Curriculum status: {env.get_curriculum_status()}")
-                
-            except Exception as e:
-                print(f"  ❌ Error: {e}")
-            
-            print("-" * 30)
-    
-    # Run all tests
-    try:
-        print("🚀 Running performance benchmark...")
-        benchmark_results = benchmark_environments()
-        
-        print("\n" + "="*60)
-        test_all_environments()
-        
-        # Performance monitor report
-        monitor = get_performance_monitor()
-        perf_report = monitor.get_performance_report()
-        suggestions = monitor.get_optimization_suggestions()
-        
-        print(f"\n📊 Performance Report:")
-        for key, value in perf_report.items():
-            print(f"  {key}: {value}")
-        
-        print(f"\n💡 Optimization Suggestions:")
-        for suggestion in suggestions:
-            print(f"  • {suggestion}")
-        
-    except Exception as e:
-        print(f"❌ Testing failed: {e}")
-        print("This might be expected if datasets are not available.")
-    
-    print("\n✅ Environment testing completed!")
-    print("🚀 Key optimizations applied:")
-    print("  • Parallel code execution with ProcessPoolExecutor")
-    print("  • LRU cache for function extraction") 
-    print("  • Optimized dataset loading with vectorized filtering")
-    print("  • Memory-efficient curriculum learning with caching")
-    print("  • Performance monitoring and suggestions")
-    print("  • ThreadPoolExecutor for I/O bound reward calculations")
-    print("  • Configurable worker counts and optimization toggles")

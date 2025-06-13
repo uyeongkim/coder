@@ -1,694 +1,968 @@
-import logging
-import wandb
+from __future__ import annotations
 import os
 import sys
-import transformers
-from rich.logging import RichHandler
+import time
+import logging
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict
-from tqdm import trange
+from typing import Dict, List, Any, Optional, Tuple
+from collections import defaultdict
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+from rich.console import Console
+from rich.table import Table
+from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn
+from rich.panel import Panel
+from rich.text import Text
+from rich.logging import RichHandler
+import wandb
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(ROOT_DIR)
 
+# 기존 yy_env.py 사용 (완성된 환경)
 from yy_env import (
-    create_env,
-    EnvConfig, 
-    CurriculumConfig,
+    EnvConfig, create_env
 )
+from shppo.model import (
+    SHPPOModelConfig, RoleConfig, EnhancedSharedLLM, 
+    build_enhanced_actor_and_critic, SHPPOLossComputer
+)
+from shppo.utils import RolloutBuffer, Trajectory, set_seed, move_to
 
-from shppo.model import build_actor_and_critic
-from shppo.utils import RolloutBuffer, check_for_nan_and_abort
-
-# ───────── Prompt repository keyed by agent role ─────────
-ROLE_PROMPTS = {
-    "planner": [
-        {"role": "system", "content": (
-            "You are the planner. Create a concise, step-by-step solution outline in markdown. "
-            "Include function names, brief descriptions, and any edge cases to handle."
-        )},
-        {"role": "user", "content": (
-            "{task_description}\n\nProvide the detailed plan."
-        )},
-    ],
-    "coder": [
-        {"role": "system", "content": (
-            "You are the coder. Implement `solve(input_str: str) -> str` based on the planner's plan. "
-        )},
-        {"role": "user", "content": (
-            "Plan:\n{planner_plan}\n\nWrite the `solve` function and runner."
-        )},
-    ],
-    "debugger": [
-        {"role": "system", "content": (
-            "You are the debugger. Examine the `solve` function code and its execution output. "
-            "Fix bugs, handle edge cases, and return the corrected function with brief explanations."
-        )},
-        {"role": "user", "content": (
-            "Code:\n{code}\n\nOutput:\n{execution_output}\n\nProvide the corrected `solve` function."
-        )},
-    ],
-}
-
-
-@dataclass
-class TeamResult:
-    plan: str
-    code: str
-    execution_result: List[Dict]
-
-# ══════════════════ 1. Configs ══════════════════
-@dataclass
-class RoleConfig:
-    role_name: str
-    obs_embed_dim: int
+# Type hints for env.py compatibility
+type_obs = Dict[str, Any]
+type_act = Dict[str, str]
 
 @dataclass
 class SHPPOConfig:
-    # Lora configuration
-    base_model_name: str = "Qwen/Qwen2.5-Coder-0.5B-Instruct"
-    target_modules: List[str] = field(default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj"])
-    lora_r: int = 8
-    lora_alpha: int = 16
+    # Environment
+    env_config: EnvConfig = field(default_factory=lambda: EnvConfig(
+        max_problems=100,
+        batch_size=4
+    ))
     
-    # Model configuration
-    latent_dim: int = 16
-    hete_layer_input_dim: int = 512
-    hete_layer_output_dim: int = 64
-    mlp_hidden_dim: int = 256
+    # Model
+    model_config: SHPPOModelConfig = field(default_factory=lambda: SHPPOModelConfig(
+        base_model_name="Qwen/Qwen2.5-Coder-0.5B-Instruct",
+        lora_r=8,
+        lora_alpha=16,
+        latent_dim=4,
+        hete_layer_input_dim=128,
+        hete_layer_output_dim=32,
+        mlp_hidden_dim=64
+    ))
     
-    # agent configuration
-    num_agents: int = 2
-    role_configs: List[RoleConfig] = field(default_factory=lambda: [
-        RoleConfig(role_name="planner", obs_embed_dim=64),
-        RoleConfig(role_name="coder", obs_embed_dim=64)
-    ])
+    # Roles
+    roles: Dict[str, RoleConfig] = field(default_factory=lambda: {
+        "planner": RoleConfig("planner", obs_embed_dim=128, n_action_templates=4),
+        "coder": RoleConfig("coder", obs_embed_dim=128, n_action_templates=4),
+        "debugger": RoleConfig("debugger", obs_embed_dim=128, n_action_templates=4),
+    })
     
-    # Train configuration
-    num_episodes: int = 1000
-    lr = 1e-4
-    warmup_ratio: float = 0.1
-    gamma: float = 0.99
-    gae_lambda: float = 0.95
-    # runtime flags (copied from PPOConfig defaults)
-    use_mixed_precision: bool = True
-    cleanup_frequency: int = 10
-    inf_batchsize: int = 32
-    num_envs: int = 8
-    train_batchsize: int = 32
-    grad_accumulation_steps: int = 1
+    # Training
+    n_episodes: int = 100
+    n_epochs: int = 4
+    mini_batch_size: int = 2
+    
+    # Separate Learning Rates for Each Component
+    lr_actor: float = 3e-4
+    lr_critic: float = 1e-3
+    lr_latent: float = 5e-4
+    lr_inference: float = 1e-3
+    lr_llm: float = 1e-5
+    lr_projection: float = 1e-3
+    
+    # PPO Parameters
+    gamma: float = 0.95
+    lam: float = 0.9
+    clip_eps: float = 0.2
+    entropy_coeff: float = 0.01
     max_grad_norm: float = 0.5
-    lambda_e: float = 0.01  # entropy regularization coefficient
-    lamda_d: float = 0.01  # diversity regularization coefficient
     
-    # Env configuration
-    env_type: str = "curriculum_error"
-    max_problem_length: int = 512
-    max_solution_length: int = 512
-    max_problems: int = 100_000
+    # Loss Weights (Equation 10)
+    lambda_entropy: float = 0.01
+    lambda_distance: float = 0.1
     
-    def __post_init__(self):
-        # there should be at least one coder
-        if not any(role.role_name == "coder" for role in self.role_configs):
-            raise ValueError("At least one role must be a coder.")
-        
-        # sort roles by planner -> coder -> debugger
-        self.role_configs.sort(
-            key=lambda x: ["planner", "coder", "debugger"].index(x.role_name) \
-                if x.role_name in ["planner", "coder", "debugger"] else 3)
-
-# =═══════════════════════════════════════════════════════════════════════════logger, 
-# Set up rich logging
-# ═══════════════════════════════════════════════════════════════════════
-RICH_FORMAT = "[%(filename)s:%(lineno)s] >> %(message)s"
-
-logging.basicConfig(
-    level="INFO",
-    format=RICH_FORMAT,
-    handlers=[RichHandler(rich_tracebacks=True)],
-)
-# Set up rich logging
-logger = logging.getLogger(__name__)
-def handle_exception(exc_type, exc_value, exc_traceback):
-    if issubclass(exc_type, KeyboardInterrupt):
-        sys.exit(0)
-    logger.error("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
+    # Training Control - REMOVED update_llm choice
+    use_enhanced_generation: bool = True
     
-sys.excepthook = handle_exception
+    # Logging
+    log_interval: int = 5
+    eval_interval: int = 20
+    save_interval: int = 50
+    checkpoint_dir: str = "./checkpoints_complete"
+    wandb_project: str = "shppo"
+    wandb_run_name: Optional[str] = None
+    
+    # Device
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    seed: int = 42
 
-class SHPPOTrainer:
+class CompleteSHPPOTrainer:
+    """Complete SHPPO Trainer with all loss functions and separate optimizers"""
+    
     def __init__(self, config: SHPPOConfig):
         self.cfg = config
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
+        set_seed(self.cfg.seed)
         
-        self.global_step = 0
+        # Rich console setup
+        self.console = Console()
         
-        (
-            self.actors,
-            self.critic,
-            self.latent_net,
-            self.inference_net,
-        ) = build_actor_and_critic(config, self.device)
-        self.actors = [torch.compile(actor) for actor in self.actors]
-        self.critic = torch.compile(self.critic)
-        self.latent_net = torch.compile(self.latent_net).to(self.device)
-        self.inference_net = torch.compile(self.inference_net).to(self.device)
+        # Training mode flag (like PyTorch modules)
+        self.training = True
         
-        # optimizer: only use parameters from actors[0], critic, latent_net, inference_net
-        self.optimizer = torch.optim.Adam(
-            list(self.actors[0].parameters())
-            + list(self.critic.parameters())
-            + list(self.latent_net.parameters())
-            + list(self.inference_net.parameters()),
-            lr=config.lr, eps = 1e-8, weight_decay=1e-4
+        # Setup
+        self._setup_logging()
+        
+        # Create environment using yy_env
+        self.env = create_env("simple_simple", self.cfg.env_config)
+        
+        self._build_models()
+        self._setup_optimizers()
+        self._setup_loss_computer()
+        
+        # Buffers and states
+        self.buffers = {role: RolloutBuffer(self.cfg.gamma, self.cfg.lam) 
+                       for role in self.cfg.roles.keys()}
+        
+        device = torch.device(self.cfg.device)
+        self.hidden_states = {
+            role: torch.zeros(1, self.cfg.model_config.hete_layer_input_dim, 
+                            device=device, dtype=torch.float32) 
+            for role in self.cfg.roles.keys()
+        }
+        
+        # Training state
+        self.episode = 0
+        self.step = 0
+        self.best_reward = float('-inf')
+        self.metrics = defaultdict(list)
+        
+        self.console.print(Panel(
+            "[bold green]✅ Complete SHPPO Trainer Initialized[/bold green]\n"
+            f"• Device: {self.cfg.device}\n"
+            f"• Roles: {list(self.cfg.roles.keys())}\n"
+            f"• Episodes: {self.cfg.n_episodes}\n"
+            f"• LLM Training: Always Enabled\n"
+            f"• Optimizers: {len(self.opt_actors) + 4}",
+            title="🚀 SHPPO Setup Complete"
+        ))
+    
+    def train_mode(self, mode: bool = True):
+        """Set training mode for the trainer and all models"""
+        self.training = mode
+        for actor in self.actors.values():
+            actor.train(mode)
+        self.critic.train(mode)
+        self.inference_net.train(mode)
+        self.llm.model.train(mode)
+        self.obs_projection.train(mode)
+        return self
+    
+    def eval_mode(self):
+        """Set evaluation mode"""
+        return self.train_mode(False)
+        
+    def _setup_logging(self):
+        os.makedirs(self.cfg.checkpoint_dir, exist_ok=True)
+        
+        # Rich handler for beautiful logging
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(message)s",
+            datefmt="[%X]",
+            handlers=[
+                RichHandler(console=Console(), rich_tracebacks=True),
+                logging.FileHandler(f'{self.cfg.checkpoint_dir}/training.log')
+            ]
         )
-        self.scheduler = transformers.get_scheduler(
-            name="cosine",
-            optimizer=self.optimizer,
-            num_warmup_steps=int(config.num_episodes * config.warmup_ratio),
-            num_training_steps=config.num_episodes
+        self.logger = logging.getLogger(__name__)
+        
+        # WandB setup
+        wandb.init(
+            project=self.cfg.wandb_project,
+            name=self.cfg.wandb_run_name or f"complete-run-{int(time.time())}",
+            config=self.cfg.__dict__,
+            reinit=True
         )
         
-        self._setup_env()
-        self.buffer = RolloutBuffer(config.gamma, config.gae_lambda)
-        wandb.init(project="shppo", config=config, reinit=True)
+        # Rich console
+        if not hasattr(self, 'console'):
+            self.console = Console()
         
+    def _build_models(self):
+        device = torch.device(self.cfg.device)
         
-    def _setup_env(self):
-        train_env_cfg = EnvConfig(
-            batch_size=self.cfg.inf_batchsize,
-            max_problem_length=self.cfg.max_problem_length,
-            max_solution_length=self.cfg.max_solution_length,
-            max_problems=100_000,
-            split="train",
-        )
-        eval_env_cfg = EnvConfig(
-            batch_size=self.cfg.inf_batchsize,
-            max_problem_length=self.cfg.max_problem_length,
-            max_solution_length=self.cfg.max_solution_length,
-            max_problems=100,
-            split="valid",
-        )
-        test_env_cfg = EnvConfig(
-            batch_size=self.cfg.inf_batchsize,
-            max_problem_length=self.cfg.max_problem_length,
-            max_solution_length=self.cfg.max_solution_length,
-            max_problems=100_000,
-            split="test",
+        # Enhanced LLM with proper generation
+        self.llm = EnhancedSharedLLM(self.cfg.model_config, device)
+        
+        # Build enhanced actor-critic with scalable inference net
+        self.actors, self.critic, self.inference_net = build_enhanced_actor_and_critic(
+            self.cfg.model_config, self.cfg.roles, device
         )
         
-        if "curriculum" in self.cfg.env_type:
-            self.curriculum_cfg = CurriculumConfig()
+        # Observation projection (LLM embeddings -> RL embeddings)
+        self.obs_projection = nn.Linear(
+            self.llm.model.config.hidden_size,
+            self.cfg.model_config.hete_layer_input_dim
+        ).to(device)
+        
+        self.console.print(f"[green]✅ Models built on {device}[/green]")
+        
+    def _setup_optimizers(self):
+        """Setup separate optimizers for each component"""
+        
+        # 1. Actor optimizers (per role)
+        self.opt_actors = {
+            role: torch.optim.Adam(actor.parameters(), lr=self.cfg.lr_actor)
+            for role, actor in self.actors.items()
+        }
+        
+        # 2. Critic optimizer
+        critic_params = list(self.critic.parameters()) + list(self.obs_projection.parameters())
+        self.opt_critic = torch.optim.Adam(critic_params, lr=self.cfg.lr_critic)
+        
+        # 3. Latent network optimizer (separate from actors)
+        latent_params = []
+        for actor in self.actors.values():
+            latent_params.extend(actor.enc.parameters())  # Encoder parameters
+        self.opt_latent = torch.optim.Adam(latent_params, lr=self.cfg.lr_latent)
+        
+        # 4. Inference network optimizer
+        self.opt_inference = torch.optim.Adam(
+            self.inference_net.parameters(), lr=self.cfg.lr_inference
+        )
+        
+        # 5. LLM optimizer - ALWAYS ENABLED
+        self.llm.set_llm_training_mode(True)  # Always enable LLM training
+        llm_params = self.llm.trainable_parameters()
+        if llm_params:
+            self.opt_llm = torch.optim.Adam(llm_params, lr=self.cfg.lr_llm)
+            self.console.print("[green]✅ LLM LoRA parameters enabled for training[/green]")
         else:
-            self.curriculum_cfg = None
+            self.opt_llm = None
+            self.console.print("[red]❌ No trainable LLM parameters found[/red]")
         
-        self.env = create_env(self.cfg.env_type, train_env_cfg, self.curriculum_cfg)
-        self.eval_env = create_env(self.cfg.env_type, eval_env_cfg, self.curriculum_cfg)
-        self.test_env = create_env(self.cfg.env_type, test_env_cfg, self.curriculum_cfg)
+        self.console.print(f"[green]✅ Setup {len(self.opt_actors)} actor optimizers + 4 other optimizers[/green]")
         
-        logger.info(f"🌟 Created environments with type: {self.cfg.env_type}")
+    def _setup_loss_computer(self):
+        """Setup loss computer with paper's parameters"""
+        self.loss_computer = SHPPOLossComputer(
+            lambda_e=self.cfg.lambda_entropy,
+            lambda_d=self.cfg.lambda_distance
+        )
+    
+    def _embed_observation(self, obs: type_obs) -> torch.Tensor:
+        """Embed observation using enhanced LLM"""
+        role = obs["role"]
         
+        # Handle visible files format
+        files_text = "\n".join([f"=== {fname} ===\n{content[:200]}..." 
+                            for fname, content in obs["visible_files"].items()])
         
-    def collect_rollout(self):
-        """
-        Collect a multi‑agent rollout (planner → coder → optional debugger) and
-        push it to the shared RolloutBuffer. Now runs for num_agents steps per episode,
-        maintaining per-agent hidden states.
-        """
-        total_samples = self.cfg.num_envs
-        batch_size    = self.cfg.inf_batchsize
-
-        # Map each role to *all* matching actor indices (supports multiple planners, coders, etc.)
-        role_to_indices: Dict[str, List[int]] = {}
-        for i, r in enumerate(self.cfg.role_configs):
-            role_to_indices.setdefault(r.role_name, []).append(i)
-
-        planner_idxs  = role_to_indices.get("planner", [])
-        coder_idxs    = role_to_indices.get("coder", [])
-        debugger_idxs = role_to_indices.get("debugger", [])
-
-        has_planner  = len(planner_idxs) > 0
-        has_debugger = len(debugger_idxs) > 0
-
-        # Use the first coder/debugger for now (extend later if needed)
-        coder_actor    = self.actors[coder_idxs[0]] if coder_idxs else self.actors[0]
-        planner_actors = [self.actors[i] for i in planner_idxs]
-        debugger_actor = self.actors[debugger_idxs[0]] if has_debugger else None
-
-        gpu_data_batches : list[dict] = []
-
-        # Number of steps per episode = number of agents
-        max_steps = self.cfg.num_agents
-
-        # Initialize per-agent hidden states
-        h_prevs = [None] * len(self.actors)
-
-        for start in trange(0, total_samples, batch_size,
-                            desc="GPU inference", position=1, leave=False):
-
-            # Containers for per‑role log‑probs
-            planner_logprobs_list: List[torch.Tensor] = []
-
-            # Multi-step within this batch
-            for step in range(max_steps):
-                # Use persistent hidden states for each actor
-                # ── 1. Get (or retain) the current batch of tasks ─────────────
-                if step == 0:
-                    self.env.reset_batch()
-                tasks  = self.env.batch
-                cur_bs = len(tasks)
-
-                # Compute global feature: one-hot difficulty per task (easy, medium, hard, unknown)
-                global_feats = []
-                for t in tasks:
-                    tags = set(t.get("cf_tags", []))
-                    # Determine tag sets
-                    easy_tags = set(getattr(self.cfg, "easy_tags", []))
-                    medium_tags = set(getattr(self.cfg, "medium_tags", []))
-                    hard_tags = set(getattr(self.cfg, "hard_tags", []))
-                    # Classify
-                    if not tags:
-                        idx = 3  # unknown
-                    elif tags & easy_tags:
-                        idx = 0
-                    elif tags & medium_tags:
-                        idx = 1
-                    elif tags & hard_tags:
-                        idx = 2
-                    else:
-                        idx = 3  # unknown
-                    onehot = [0] * 4
-                    onehot[idx] = 1
-                    global_feats.append(onehot)
-                global_feats = torch.tensor(global_feats, dtype=torch.float32, device=self.device)
-
-                # Track artefacts per task
-                team_results = [TeamResult(plan="", code="", execution_result=[])
-                                for _ in range(cur_bs)]
-
-                # ── 2. Planner(s) (optional, may be multiple) ──────────────────
-                if has_planner:
-                    # For each task we accumulate every planner's output,
-                    # then concatenate them before handing to the coder.
-                    collected_plans: List[List[str]] = [[] for _ in range(cur_bs)]
-                    # Save prompts for PPO
-                    prompt_texts_list = []
-                    for idx, pa in zip(planner_idxs, planner_actors):
-                        planner_prompts = []
-                        for t in tasks:
-                            planner_prompts.append([
-                                ROLE_PROMPTS["planner"][0],
-                                {
-                                    **ROLE_PROMPTS["planner"][1],
-                                    "content": ROLE_PROMPTS["planner"][1]["content"].format(
-                                        task_description=t["description"]
-                                    ),
-                                },
-                            ])
-                        # Save prompts for PPO
-                        prompt_texts = []
-                        for p in planner_prompts:
-                            if hasattr(pa.llm.tokenizer, "apply_chat_template"):
-                                prompt_texts.append(pa.llm.tokenizer.apply_chat_template(p, tokenize=False))
-                            else:
-                                prompt_texts.append("\n".join(f"{d['role']}: {d['content']}" for d in p))
-                        prompt_texts_list = prompt_texts.copy()
-                        with torch.no_grad():
-                            with torch.cuda.amp.autocast():
-                                plan_gen = pa.generate(planner_prompts, h_prev=h_prevs[idx])
-                        h_prevs[idx] = plan_gen.get('h_next', None)
-                        planner_logprobs_list.append(plan_gen["logprobs"])
-                        plans = plan_gen["texts"]
-                        for i in range(cur_bs):
-                            collected_plans[i].append(plans[i])
-                    # Concatenate all planners' outputs (separated by blank lines)
-                    for i in range(cur_bs):
-                        team_results[i].plan = "\n\n".join(collected_plans[i])
-
-                # ── 3. Coder ────────────────────────────────────────────────────
-                coder_prompts = []
-                for i in range(cur_bs):
-                    coder_prompts.append([
-                        ROLE_PROMPTS["coder"][0],
-                        {
-                            **ROLE_PROMPTS["coder"][1],
-                            "content": ROLE_PROMPTS["coder"][1]["content"].format(
-                                planner_plan=team_results[i].plan
-                            ),
-                        },
-                    ])
-                # Save prompts for PPO
-                coder_prompt_texts = []
-                for p in coder_prompts:
-                    if hasattr(coder_actor.llm.tokenizer, "apply_chat_template"):
-                        coder_prompt_texts.append(coder_actor.llm.tokenizer.apply_chat_template(p, tokenize=False))
-                    else:
-                        coder_prompt_texts.append("\n".join(f"{d['role']}: {d['content']}" for d in p))
-                with torch.no_grad():
-                    with torch.cuda.amp.autocast():
-                        coder_gen = coder_actor.generate(coder_prompts, h_prev=h_prevs[coder_idxs[0]])
-                h_prevs[coder_idxs[0]] = coder_gen.get('h_next', None)
-                coder_sequences = coder_gen["sequences"]
-                coder_logprobs  = coder_gen["logprobs"]
-                codes           = coder_gen["texts"]
-                mu              = coder_gen["mu"]
-                sigma           = coder_gen["sigma"]
-                for i, c in enumerate(codes):
-                    team_results[i].code = c
-                # First execution
-                exec_rewards = self.env.step_batch(codes)
-                for i, r in enumerate(exec_rewards):
-                    team_results[i].execution_result.append(r)
-
-                # ── 4. Debugger (optional) ──────────────────────────────────────
-                final_seq     = coder_sequences
-                final_logprob = coder_logprobs
-                final_codes   = codes
-                final_mu      = mu
-                final_sigma   = sigma
-                if has_debugger:
-                    # Prepare debugger prompts using the coder's output
-                    dbg_prompts = []
-                    for i in range(cur_bs):
-                        exec_lines = [
-                            f"{r['input']}: {r['output']} {'SUCCESS' if r['succeed'] else 'FAIL'}"
-                            for r in team_results[i].execution_result
-                        ]
-                        execution_output = "\n".join(exec_lines)
-                        dbg_prompts.append([
-                            ROLE_PROMPTS["debugger"][0],
-                            {
-                                **ROLE_PROMPTS["debugger"][1],
-                                "content": ROLE_PROMPTS["debugger"][1]["content"].format(
-                                    code=team_results[i].code,
-                                    execution_output=execution_output,
-                                ),
-                            },
-                        ])
-                    # Save prompts for PPO
-                    debugger_prompt_texts = []
-                    for p in dbg_prompts:
-                        if hasattr(debugger_actor.llm.tokenizer, "apply_chat_template"):
-                            debugger_prompt_texts.append(debugger_actor.llm.tokenizer.apply_chat_template(p, tokenize=False))
-                        else:
-                            debugger_prompt_texts.append("\n".join(f"{d['role']}: {d['content']}" for d in p))
-                    with torch.no_grad():
-                        with torch.cuda.amp.autocast():
-                            dbg_gen = debugger_actor.generate(dbg_prompts, h_prev=h_prevs[debugger_idxs[0]])
-                    h_prevs[debugger_idxs[0]] = dbg_gen.get('h_next', None)
-                    final_seq     = dbg_gen["sequences"]
-                    final_logprob = dbg_gen["logprobs"]
-                    final_codes   = dbg_gen["texts"]
-                    final_mu      = dbg_gen["mu"]
-                    final_sigma   = dbg_gen["sigma"]
-                    dbg_rewards = self.env.step_batch(final_codes)
-                    for i, r in enumerate(dbg_rewards):
-                        team_results[i].execution_result.append(r)
-                    rewards = dbg_rewards
+        prompt = f"Role: {role}\n\nFiles:\n{files_text}\n\nAnalyze:"
+        
+        # Always allow gradients for embedding computation
+        raw_emb = self.llm.embed_observation_with_gradient(
+            [prompt], 
+            allow_grad=self.training
+        )
+        
+        # Project to RL embedding space
+        obs_emb = self.obs_projection(raw_emb)
+        return obs_emb
+        
+    def _select_action(self, role: str, obs_emb: torch.Tensor, hidden: torch.Tensor):
+        """Select action and compute all required values"""
+        actor = self.actors[role]
+        
+        # Forward pass through actor
+        logits, new_hidden, (latent, mu, sigma) = actor(obs_emb.float(), hidden.float())
+        
+        # Sample action
+        probs = F.softmax(logits, dim=-1)
+        dist = torch.distributions.Categorical(probs)
+        action = dist.sample()
+        logprob = dist.log_prob(action)
+        
+        # Compute value using critic
+        value_dict = self.critic(new_hidden)
+        value = value_dict[role]
+        
+        return {
+            'action': action.item(),
+            'logprob': logprob,
+            'value': value,
+            'new_hidden': new_hidden,
+            'latent': latent,
+            'mu': mu,
+            'sigma': sigma,
+            'logits': logits
+        }
+        
+    def _generate_content(self, role: str, action_idx: int, latent: torch.Tensor) -> str:
+        """Generate content using enhanced LLM with latent conditioning"""
+        return self.llm.generate_with_latent_conditioning(role, action_idx, latent)
+        
+    def _run_episode(self) -> Dict[str, float]:
+        """Run one complete episode"""
+        
+        # Reset environment and get batch of problems
+        obs_batch = self.env.reset_batch()
+        
+        episode_reward = 0.0
+        episode_length = 0
+        final_reward = 0.0
+        
+        # Reset states and buffers
+        device = torch.device(self.cfg.device)
+        for role in self.cfg.roles.keys():
+            self.hidden_states[role] = torch.zeros(1, self.cfg.model_config.hete_layer_input_dim, 
+                                                  device=device, dtype=torch.float32)
+            self.buffers[role].reset()
+        
+        # Store episode data for inference net
+        episode_latent_data = []
+        
+        # Generate solutions for each problem in the batch
+        batch_solutions = []
+        
+        for batch_idx, problem in enumerate(obs_batch):
+            self.console.print(f"[blue]🔧 Processing problem {batch_idx + 1}/{len(obs_batch)}: {problem.get('name', 'Unknown')}[/blue]")
+            
+            # Generate solution for this problem using multi-agent workflow
+            solution = self._generate_solution_for_problem(problem, episode_latent_data)
+            batch_solutions.append(solution)
+            
+            episode_length += 3  # planner, coder, debugger
+            self.step += 1
+        
+        # Submit all solutions to environment at once
+        rewards = self.env.step_batch(batch_solutions)
+        
+        # Calculate episode metrics
+        episode_reward = sum(rewards) / len(rewards)
+        final_reward = episode_reward
+        
+        # Distribute rewards to trajectories
+        self._distribute_rewards_to_trajectories(rewards)
+        
+        # Compute GAE for all roles
+        self._compute_gae()
+        
+        return {
+            "episode_reward": episode_reward,
+            "episode_length": episode_length,
+            "final_reward": final_reward,
+            "latent_data": episode_latent_data
+        }
+    
+    def _generate_solution_for_problem(self, problem: Dict[str, Any], episode_latent_data: List) -> str:
+        """Generate solution for a single problem using multi-agent workflow"""
+        
+        # Initialize problem workspace
+        workspace = {
+            "visible_files": {
+                "problem.md": f"# {problem.get('name', 'Problem')}\n\n{problem.get('description', 'No description')}"
+            }
+        }
+        
+        # Multi-agent workflow: planner -> coder -> debugger
+        roles_sequence = ["planner", "coder", "debugger"]
+        device = torch.device(self.cfg.device)  # FIXED: Get device
+        
+        for role in roles_sequence:
+            # Create role-specific observation
+            role_obs = {
+                "role": role,
+                "visible_files": workspace["visible_files"].copy()
+            }
+            
+            # Process this role
+            obs_emb = self._embed_observation(role_obs)
+            action_data = self._select_action(role, obs_emb, self.hidden_states[role])
+            
+            # Update hidden state for this role
+            self.hidden_states[role] = action_data['new_hidden']
+            
+            # Generate content based on role
+            content = self._generate_content(role, action_data['action'], action_data['latent'])
+            
+            # Add generated content to workspace
+            if role == "planner":
+                filename = "plan.md"
+            elif role == "coder":
+                filename = "code.py"
+            else:  # debugger
+                filename = "fixed_code.py"
+                
+            workspace["visible_files"][filename] = content
+            
+            # Store trajectory for this role - FIXED: Ensure all tensors are on same device
+            traj = Trajectory(
+                state=obs_emb.squeeze(0).to(device),
+                latent=action_data['latent'].squeeze(0).to(device),
+                action=torch.tensor(action_data['action'], device=device),  # FIXED: Specify device
+                logp=action_data['logprob'].to(device),
+                reward=torch.tensor(0.0, device=device),  # FIXED: Specify device
+                value=action_data['value'].to(device)
+            )
+            
+            # Store additional data for complete loss computation - FIXED: Ensure device consistency
+            traj.mu = action_data['mu'].squeeze(0).to(device)
+            traj.sigma = action_data['sigma'].squeeze(0).to(device)
+            traj.obs_emb = obs_emb.squeeze(0).to(device)
+            
+            self.buffers[role].add(traj)
+            
+            episode_latent_data.append({
+                'role': role,
+                'mu': action_data['mu'].to(device),
+                'sigma': action_data['sigma'].to(device),
+                'latent': action_data['latent'].to(device),
+                'obs_emb': obs_emb.to(device)
+            })
+        
+        # Return the final code solution
+        return workspace["visible_files"]["code.py"]
+    
+    def _distribute_rewards_to_trajectories(self, rewards: List[float]):
+        """Distribute batch rewards to individual trajectories"""
+        device = torch.device(self.cfg.device)  # FIXED: Get device
+        
+        # Each problem generates 3 trajectories (planner, coder, debugger)
+        # Distribute each problem's reward to its 3 trajectories
+        
+        problem_idx = 0
+        for role in ["planner", "coder", "debugger"]:
+            for traj_idx, traj in enumerate(self.buffers[role].traj):
+                current_problem_idx = traj_idx  # Each role has one trajectory per problem
+                if current_problem_idx < len(rewards):
+                    traj.reward = torch.tensor(rewards[current_problem_idx], device=device)  # FIXED: Specify device
                 else:
-                    rewards = exec_rewards
-
-                # Consolidate planner log‑probs into a tensor of shape
-                #   (num_planners, batch_size)  or  None if no planner
-                planner_logprobs = (
-                    torch.stack(planner_logprobs_list) if planner_logprobs_list else None
-                )
-
-                # ── 5. Critic forward & sanity checks ──────────────────────────
-                with torch.no_grad():
-                    if self.cfg.use_mixed_precision:
-                        with torch.cuda.amp.autocast():
-                            outputs = coder_actor.llm.model(
-                                input_ids=final_seq,
-                                output_hidden_states=True,
-                            )
-                    else:
-                        outputs = coder_actor.llm.model(
-                            input_ids=final_seq,
-                            output_hidden_states=True,
-                        )
-                    last_hidden = outputs.hidden_states[-1][:, -1, :].float()
-                    check_for_nan_and_abort(last_hidden, "hidden states", logger, f"batch start={start}")
-                    # Centralized critic over all agents’ latents + global feature
-                    # Collect mu/sigma for all agents
-                    # If all_generations is available, collect from each agent
-                    all_generations = []
-                    if has_planner:
-                        for idx, pa in zip(planner_idxs, planner_actors):
-                            # For planner, need to get mu/sigma if available
-                            # Not available in current code, so fallback to coder/debugger
-                            pass
-                    # For coder and debugger
-                    mu_list = []
-                    sigma_list = []
-                    mu_list.append(mu)
-                    sigma_list.append(sigma)
-                    if has_debugger:
-                        mu_list[-1] = final_mu
-                        sigma_list[-1] = final_sigma
-                    # If multi-agent, this should include all agents' mu/sigma
-                    mus    = torch.stack(mu_list, dim=1)
-                    sigmas = torch.stack(sigma_list, dim=1)
-                    joint  = torch.cat([
-                        mus.view(mus.shape[0], -1),
-                        sigmas.view(sigmas.shape[0], -1),
-                        global_feats
-                    ], dim=-1)
-                    values = self.critic(joint).squeeze(-1).detach()
-                    check_for_nan_and_abort(values, "critic values", logger, f"batch start={start}")
-
-                # ── 6. Move to CPU and store ────────────────────────────────────
-                gpu_data_batches.append({
-                    "planner_logprobs": planner_logprobs.cpu() if planner_logprobs is not None else None,
-                    "coder_logprobs"  : coder_logprobs.cpu(),
-                    "debugger_logprobs": final_logprob.cpu() if has_debugger else None,
-                    "states"  : last_hidden.cpu(),
-                    "actions" : final_seq.cpu(),
-                    "values"  : values.cpu(),
-                    "rewards" : torch.tensor(rewards, dtype=torch.float32),
-                    "mu": mu.cpu(),
-                    "sigma": sigma.cpu(),
-                    "global_feats": global_feats.cpu(),
-                    # Store per-agent prompts for PPO
-                    "prompts": coder_prompt_texts,
-                })
-
-                if start % self.cfg.cleanup_frequency == 0:
-                    torch.cuda.empty_cache()
-
-        # ── 7. Aggregate & normalize rewards ───────────────────────────────
-        all_rewards = torch.cat([b["rewards"] for b in gpu_data_batches], dim=0)
-        all_rewards = (all_rewards - all_rewards.mean()) / (all_rewards.std() + 1e-8)
-
-        # ── 8. Push into RolloutBuffer -------------------------------------
-        # Ensure the buffer has per‑role log‑prob containers
-        if not hasattr(self.buffer, "planner_logprobs"):
-            self.buffer.planner_logprobs = []
-        if not hasattr(self.buffer, "coder_logprobs"):
-            self.buffer.coder_logprobs = []
-        if not hasattr(self.buffer, "debugger_logprobs"):
-            self.buffer.debugger_logprobs = []
-        if not hasattr(self.buffer, "mu"):
-            self.buffer.mu = []
-        if not hasattr(self.buffer, "sigma"):
-            self.buffer.sigma = []
-        if not hasattr(self.buffer, "global_feats"):
-            self.buffer.global_feats = []
-        if not hasattr(self.buffer, "prompts"):
-            self.buffer.prompts = []
-
-        self.buffer.reset()
-        ptr = 0
-        for b in gpu_data_batches:
-            bs = b["rewards"].size(0)
-            self.buffer.states   += list(b["states"])
-            self.buffer.actions  += list(b["actions"])
-            self.buffer.values   += list(b["values"])
-            self.buffer.rewards  += list(all_rewards[ptr:ptr+bs])
-            ptr += bs
-
-            # Per‑role log‑probs
-            if b["planner_logprobs"] is not None:
-                # planner_logprobs shape: (num_planners, bs)
-                self.buffer.planner_logprobs += list(b["planner_logprobs"].transpose(0, 1))
-            else:
-                self.buffer.planner_logprobs += [torch.tensor([])] * bs  # placeholder
-
-            self.buffer.coder_logprobs   += list(b["coder_logprobs"])
-            if b["debugger_logprobs"] is not None:
-                self.buffer.debugger_logprobs += list(b["debugger_logprobs"])
-            else:
-                self.buffer.debugger_logprobs += [torch.tensor([])] * bs
-            self.buffer.mu         += list(b["mu"])
-            self.buffer.sigma      += list(b["sigma"])
-            self.buffer.global_feats += list(b["global_feats"])
-            # Store prompts for PPO
-            self.buffer.prompts += list(b["prompts"])
-
-        self.last_rewards = all_rewards.to(self.device)
+                    traj.reward = torch.tensor(0.0, device=device)  # FIXED: Specify device
+        
+    def _compute_gae(self):
+        """Compute Generalized Advantage Estimation for all roles"""
+        device = torch.device(self.cfg.device)  # FIXED: Get device
+        
+        for role, buffer in self.buffers.items():
+            if len(buffer.traj) == 0:
+                continue
+                
+            rewards = [t.reward.item() for t in buffer.traj]
+            values = [t.value.item() for t in buffer.traj]
+            
+            # GAE computation
+            advantages = []
+            returns = []
+            gae = 0.0
+            
+            for t in reversed(range(len(rewards))):
+                next_value = 0.0 if t == len(rewards) - 1 else values[t + 1]
+                delta = rewards[t] + self.cfg.gamma * next_value - values[t]
+                gae = delta + self.cfg.gamma * self.cfg.lam * gae
+                advantages.insert(0, gae)
+                returns.insert(0, gae + values[t])
+            
+            # Normalize advantages
+            if len(advantages) > 1:
+                mean_adv = sum(advantages) / len(advantages)
+                std_adv = (sum((a - mean_adv) ** 2 for a in advantages) / len(advantages)) ** 0.5
+                if std_adv > 1e-8:
+                    advantages = [(a - mean_adv) / (std_adv + 1e-8) for a in advantages]
+            
+            # Assign to trajectories - FIXED: Ensure device consistency
+            for i, traj in enumerate(buffer.traj):
+                traj.returns = torch.tensor(returns[i], dtype=torch.float32, device=device)  # FIXED: Specify device
+                traj.advs = torch.tensor(advantages[i], dtype=torch.float32, device=device)  # FIXED: Specify device
+        
+    def _update_networks(self):
+        """Update all networks with separate optimizers"""
+        total_losses = defaultdict(list)
+        
+        for epoch in range(self.cfg.n_epochs):
+            # 1. Update Actor Networks (PPO loss)
+            actor_losses = self._update_actors()
+            for k, v in actor_losses.items():
+                total_losses[k].extend(v)
+            
+            # 2. Update Critic Network
+            critic_losses = self._update_critic()
+            for k, v in critic_losses.items():
+                total_losses[k].extend(v)
+            
+            # 3. Update Latent Networks (Complete SHPPO losses)
+            latent_losses = self._update_latent_networks()
+            for k, v in latent_losses.items():
+                total_losses[k].extend(v)
+            
+            # 4. Update Inference Network
+            inference_losses = self._update_inference_network()
+            for k, v in inference_losses.items():
+                total_losses[k].extend(v)
+            
+            # 5. Update LLM (always enabled)
+            if self.opt_llm is not None:
+                llm_losses = self._update_llm()
+                for k, v in llm_losses.items():
+                    total_losses[k].extend(v)
+                    
+        return {k: sum(v) / len(v) if v else 0.0 for k, v in total_losses.items()}
+        
+    def _update_actors(self) -> Dict[str, List[float]]:
+        """Update actor networks with PPO loss"""
+        losses = defaultdict(list)
+        device = torch.device(self.cfg.device)  # FIXED: Get device
+        
+        for role, buffer in self.buffers.items():
+            if len(buffer.traj) == 0:
+                continue
+                
+            actor = self.actors[role]
+            optimizer = self.opt_actors[role]
+            
+            # Process mini-batches
+            indices = torch.randperm(len(buffer.traj))
+            
+            for start in range(0, len(indices), self.cfg.mini_batch_size):
+                end = min(start + self.cfg.mini_batch_size, len(indices))
+                batch_indices = indices[start:end]
+                batch = [buffer.traj[i] for i in batch_indices]
+                
+                batch_losses = []
+                batch_entropies = []
+                
+                for traj in batch:
+                    # Forward pass - FIXED: Ensure all tensors are on same device
+                    state = traj.state.unsqueeze(0).to(device)
+                    latent = traj.latent.unsqueeze(0).to(device)
+                    action = traj.action.unsqueeze(0).to(device)  # FIXED: Ensure action is on device
+                    old_logprob = traj.logp.to(device)
+                    advantages = traj.advs.to(device)
+                    
+                    # Actor forward (no gradient to latent part)
+                    with torch.no_grad():
+                        mu = traj.mu.unsqueeze(0).to(device)
+                        sigma = traj.sigma.unsqueeze(0).to(device)
+                        latent_no_grad = mu + sigma * torch.randn_like(sigma)
+                    
+                    # Only update actor head, not encoder
+                    logits = actor.head(state, latent_no_grad)
+                    
+                    # Policy loss
+                    probs = F.softmax(logits, dim=-1)
+                    dist = torch.distributions.Categorical(probs)
+                    new_logprob = dist.log_prob(action).squeeze()  # Now both tensors are on same device
+                    entropy = dist.entropy().squeeze()
+                    
+                    # PPO clipped loss
+                    ratio = torch.exp(new_logprob - old_logprob)
+                    surr1 = ratio * advantages
+                    surr2 = torch.clamp(ratio, 1 - self.cfg.clip_eps, 1 + self.cfg.clip_eps) * advantages
+                    actor_loss = -torch.min(surr1, surr2)
+                    
+                    batch_losses.append(actor_loss)
+                    batch_entropies.append(entropy)
+                
+                if batch_losses:
+                    # Combine losses
+                    total_actor_loss = torch.stack(batch_losses).mean()
+                    total_entropy = torch.stack(batch_entropies).mean()
+                    final_loss = total_actor_loss - self.cfg.entropy_coeff * total_entropy
+                    
+                    # Update
+                    optimizer.zero_grad()
+                    final_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(actor.parameters(), self.cfg.max_grad_norm)
+                    optimizer.step()
+                    
+                    losses[f'{role}_actor_loss'].append(total_actor_loss.item())
+                    losses[f'{role}_entropy'].append(total_entropy.item())
+        
+        return losses
     
-    def update(self):
-        """
-        SH-PPO update: PPO-style policy update for LoRA, critic update, then latent/inference update.
-        Each phase (policy, critic, latent/inference) does its own backward, optimizer.step(), and zero_grad().
-        """
-        # 1. Compute returns & advantages
-        self.buffer.compute_returns_advantages()
-        returns    = torch.stack(self.buffer.returns).to(self.device)
-        advantages = torch.stack(self.buffer.advantages).to(self.device)
-
-        # 2. POLICY UPDATE (LLM LoRA weights) via PPO, per-agent sequential
-        clip_eps = getattr(self.cfg, "clip_epsilon", 0.1)
-        for actor in self.actors:
-            for _ in range(getattr(self.cfg, "ppo_epochs", 1)):
-                # gather old data
-                old_logp = torch.stack(self.buffer.logprobs).to(self.device)
-                sequences = torch.stack(self.buffer.actions).to(self.device)
-                # recompute log-probs under current actor policy
-                new_logp = actor.llm._logp_from_scores(self.buffer.prompts, sequences).to(self.device)
-                ratio = (new_logp - old_logp).exp()
-                surr1 = ratio * advantages
-                surr2 = torch.clamp(ratio, 1-clip_eps, 1+clip_eps) * advantages
-                policy_loss = -torch.min(surr1, surr2).mean()
-                (policy_loss / self.cfg.grad_accumulation_steps).backward()
-                # Log gradients for debugging
-                total_norm = 0.0
-                for p in self.actors[0].parameters():
-                    if p.grad is not None:
-                        total_norm += p.grad.data.norm(2).item() ** 2
-                grad_norm = total_norm ** 0.5
-                wandb.log({"grad_norm_actor": grad_norm}, step=self.global_step)
-            # After finishing epochs for this actor, step and zero_grad
-            self.optimizer.step()
-            self.optimizer.zero_grad()
-
-        # 3. CRITIC UPDATE via MSE
-        values_pred = self.critic(torch.stack(self.buffer.states).to(self.device)).squeeze(-1)
-        critic_loss = F.mse_loss(values_pred, returns)
-        (critic_loss / self.cfg.grad_accumulation_steps).backward()
-        # Log gradients for debugging
-        total_norm = 0.0
-        for p in self.critic.parameters():
-            if p.grad is not None:
-                total_norm += p.grad.data.norm(2).item() ** 2
-        grad_norm = total_norm ** 0.5
-        wandb.log({"grad_norm_critic": grad_norm}, step=self.global_step)
-        # Step critic update
-        self.optimizer.step()
-        self.optimizer.zero_grad()
-
-        # 4. LATENT + INFERENCE UPDATE (existing logic)
-        # Reuse your existing latent losses code here:
-        #    compute Lv, Le, Ld per minibatch, backward with grad accumulation.
-        # For brevity, we call the existing multi-batch latent update:
-        latent_metrics = self._latent_inference_update()
-
-        # 5. Only step scheduler (no optimizer.step() here)
-        self.scheduler.step()
-
-        return {
-            "policy_loss": policy_loss.item(),
-            "critic_loss": critic_loss.item(),
-            **latent_metrics
-        }
-
-
-    def _latent_inference_update(self):
-        """
-        Extracts the previous latent-update logic into a helper that returns metrics.
-        Performs backward, optimizer.step(), and zero_grad() for latent/inference phase.
-        """
-        # 1. Gather full mu, sigma, global_feats from buffer
-        mu_full    = torch.stack(self.buffer.mu).to(self.device)
-        sigma_full = torch.stack(self.buffer.sigma).to(self.device)
-        global_full = torch.stack(self.buffer.global_feats).to(self.device)
-        returns    = torch.stack(self.buffer.returns).to(self.device)
-
-        # 2. Setup multi-batch parameters
-        batch_size    = self.cfg.train_batchsize
-        total_samples = returns.size(0)
-        num_batches   = (total_samples + batch_size - 1) // batch_size
-
-        critic_losses = []
-        latent_losses = []
-        entropy_terms = []
-        diversity_terms = []
-
-        for i in range(num_batches):
-            start = i * batch_size
-            end   = min(start + batch_size, total_samples)
-            mb_mu    = mu_full[start:end]
-            mb_sigma = sigma_full[start:end]
-            mb_ret   = returns[start:end]
-            mb_global = global_full[start:end]
-
-            # InferenceNet loss Lv
-            v_pred = self.inference_net(mb_mu, mb_sigma, mb_global).squeeze(-1)
-            Lv     = 0.5 * F.mse_loss(v_pred, mb_ret)
-
-            # Entropy Le and diversity Ld
-            Le = 0.5 * torch.log(2*torch.pi*torch.e*mb_sigma.pow(2)).mean()
-            dist_mat = torch.cdist(mb_mu, mb_mu, p=2)
-            Ld = -dist_mat.mean()
-
-            # Total latent loss
-            latent_loss = Lv + self.cfg.lambda_e * Le - self.cfg.lamda_d * Ld
-            (latent_loss / num_batches).backward()
-            # Log gradients for debugging
-            total_norm_latent = 0.0
-            for p in self.latent_net.parameters():
-                if p.grad is not None:
-                    total_norm_latent += p.grad.data.norm(2).item() ** 2
-            grad_norm_latent = total_norm_latent ** 0.5
-            wandb.log({"grad_norm_latent": grad_norm_latent}, step=self.global_step)
-            total_norm_inf = 0.0
-            for p in self.inference_net.parameters():
-                if p.grad is not None:
-                    total_norm_inf += p.grad.data.norm(2).item() ** 2
-            grad_norm_inf = total_norm_inf ** 0.5
-            wandb.log({"grad_norm_inference": grad_norm_inf}, step=self.global_step)
-
-            # Step latent/inference update
-            self.optimizer.step()
-            self.optimizer.zero_grad()
-
-            critic_losses.append(Lv.item())
-            latent_losses.append(latent_loss.item())
-            entropy_terms.append(Le.item())
-            diversity_terms.append(Ld.item())
-
-        return {
-            "latent_loss": sum(latent_losses)/len(latent_losses),
-            "entropy": sum(entropy_terms)/len(entropy_terms),
-            "diversity": sum(diversity_terms)/len(diversity_terms),
-        }
+    def _update_critic(self) -> Dict[str, List[float]]:
+        """Update critic network"""
+        losses = defaultdict(list)
+        device = torch.device(self.cfg.device)  # FIXED: Get device
+        
+        all_states = []
+        all_returns = []
+        all_roles = []
+        
+        # Collect all data
+        for role, buffer in self.buffers.items():
+            for traj in buffer.traj:
+                all_states.append(traj.obs_emb.to(device))  # FIXED: Ensure device
+                all_returns.append(traj.returns.to(device))  # FIXED: Ensure device
+                all_roles.append(role)
+        
+        if not all_states:
+            return losses
+        
+        # Mini-batch updates
+        indices = torch.randperm(len(all_states))
+        
+        for start in range(0, len(indices), self.cfg.mini_batch_size):
+            end = min(start + self.cfg.mini_batch_size, len(indices))
+            batch_indices = indices[start:end]
+            
+            batch_states = torch.stack([all_states[i] for i in batch_indices])
+            batch_returns = torch.stack([all_returns[i] for i in batch_indices])
+            batch_roles = [all_roles[i] for i in batch_indices]
+            
+            # Forward pass
+            value_dict = self.critic(batch_states)
+            
+            # Compute loss for each role
+            total_loss = 0
+            for i, role in enumerate(batch_roles):
+                predicted_value = value_dict[role][i]
+                target_return = batch_returns[i]
+                loss = F.mse_loss(predicted_value, target_return)
+                total_loss += loss
+                losses[f'{role}_critic_loss'].append(loss.item())
+            
+            # Update
+            self.opt_critic.zero_grad()
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                list(self.critic.parameters()) + list(self.obs_projection.parameters()),
+                self.cfg.max_grad_norm
+            )
+            self.opt_critic.step()
+        
+        return losses
     
+    def _update_latent_networks(self) -> Dict[str, List[float]]:
+        """Update latent networks with complete SHPPO losses"""
+        losses = defaultdict(list)
+        device = torch.device(self.cfg.device)  # FIXED: Get device
+        
+        # Collect latent data from all roles
+        all_mu = []
+        all_sigma = []
+        all_latent = []
+        all_obs_emb = []
+        
+        for role, buffer in self.buffers.items():
+            for traj in buffer.traj:
+                all_mu.append(traj.mu.to(device))  # FIXED: Ensure device
+                all_sigma.append(traj.sigma.to(device))  # FIXED: Ensure device
+                all_latent.append(traj.latent.to(device))  # FIXED: Ensure device
+                all_obs_emb.append(traj.obs_emb.to(device))  # FIXED: Ensure device
+        
+        if not all_mu:
+            return losses
+        
+        # Stack tensors
+        mu_batch = torch.stack(all_mu)
+        sigma_batch = torch.stack(all_sigma)
+        latent_batch = torch.stack(all_latent)
+        obs_batch = torch.stack(all_obs_emb)
+        
+        # Compute inference network value
+        batch_size = mu_batch.size(0)
+        n_templates = mu_batch.size(1)
+        latent_dim = mu_batch.size(2)
+        
+        # Combine mu and sigma: [batch_size, n_templates, latent_dim*2]
+        agent_features = torch.cat([mu_batch, sigma_batch], dim=-1)
+        # Treat each sample as single agent: [batch_size, 1, features]
+        agent_features = agent_features.view(batch_size, 1, -1)
+        
+        inference_value = self.inference_net(agent_features, obs_batch)
+        
+        # Compute all latent losses
+        latent_losses = self.loss_computer.compute_combined_latent_loss(
+            value_estimate=inference_value,
+            mu=mu_batch,
+            sigma=sigma_batch,
+            latent_samples=latent_batch
+        )
+        
+        # Update latent networks
+        self.opt_latent.zero_grad()
+        latent_losses['combined_latent_loss'].backward()
+        
+        # Clip gradients
+        latent_params = []
+        for actor in self.actors.values():
+            latent_params.extend(actor.enc.parameters())
+        torch.nn.utils.clip_grad_norm_(latent_params, self.cfg.max_grad_norm)
+        
+        self.opt_latent.step()
+        
+        # Record losses
+        for k, v in latent_losses.items():
+            losses[f'latent_{k}'].append(v.item())
+        
+        return losses
+    
+    def _update_inference_network(self) -> Dict[str, List[float]]:
+        """Update inference network with MSE loss"""
+        losses = defaultdict(list)
+        device = torch.device(self.cfg.device)  # FIXED: Get device
+        
+        # Collect data
+        all_mu = []
+        all_sigma = []
+        all_obs_emb = []
+        all_returns = []
+        
+        for role, buffer in self.buffers.items():
+            for traj in buffer.traj:
+                all_mu.append(traj.mu.to(device))  # FIXED: Ensure device
+                all_sigma.append(traj.sigma.to(device))  # FIXED: Ensure device
+                all_obs_emb.append(traj.obs_emb.to(device))  # FIXED: Ensure device
+                all_returns.append(traj.returns.to(device))  # FIXED: Ensure device
+        
+        if not all_mu:
+            return losses
+        
+        # Stack and prepare data
+        mu_batch = torch.stack(all_mu)
+        sigma_batch = torch.stack(all_sigma)
+        obs_batch = torch.stack(all_obs_emb)
+        returns_batch = torch.stack(all_returns)
+        
+        # Prepare for inference net
+        batch_size = mu_batch.size(0)
+        agent_features = torch.cat([mu_batch, sigma_batch], dim=-1)
+        agent_features = agent_features.view(batch_size, 1, -1)
+        
+        # Forward pass
+        predicted_values = self.inference_net(agent_features, obs_batch)
+        
+        # MSE loss
+        inference_loss = F.mse_loss(predicted_values, returns_batch)
+        
+        # Update
+        self.opt_inference.zero_grad()
+        inference_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.inference_net.parameters(), self.cfg.max_grad_norm)
+        self.opt_inference.step()
+        
+        losses['inference_mse_loss'].append(inference_loss.item())
+        
+        return losses
+    
+    def _update_llm(self) -> Dict[str, List[float]]:
+        """Update LLM parameters"""
+        losses = defaultdict(list)
+        device = torch.device(self.cfg.device)  # FIXED: Get device
+        
+        # Collect some recent observations for LLM training
+        recent_obs = []
+        for role, buffer in self.buffers.items():
+            if buffer.traj:
+                # Take last observation as example
+                recent_obs.append(buffer.traj[-1].obs_emb.to(device))  # FIXED: Ensure device
+        
+        if recent_obs:
+            # Simple loss: encourage diverse embeddings
+            obs_stack = torch.stack(recent_obs)
+            
+            # Compute variance loss (encourage diversity)
+            variance = torch.var(obs_stack, dim=0).mean()
+            diversity_loss = -variance  # Negative to maximize variance
+            
+            # Update LLM
+            self.opt_llm.zero_grad()
+            diversity_loss.backward()
+            
+            # Clip gradients for LoRA parameters
+            llm_params = self.llm.trainable_parameters()
+            if llm_params:
+                torch.nn.utils.clip_grad_norm_(llm_params, self.cfg.max_grad_norm)
+            
+            self.opt_llm.step()
+            
+            losses['llm_diversity_loss'].append(diversity_loss.item())
+        
+        return losses
+        
     def train(self):
-        for ep in range(self.cfg.num_episodes):
-            self.collect_rollout()
-            metrics = self.update()
-            wandb.log(metrics, step=self.global_step)
-            self.global_step += 1
+        """Main training loop with Rich interface"""
+        self.console.print(Panel(
+            f"[bold blue]🚀 Training Complete SHPPO for {self.cfg.n_episodes} episodes[/bold blue]",
+            title="Training Started"
+        ))
+        
+        # Rich progress bar
+        with Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeRemainingColumn(),
+            console=self.console
+        ) as progress:
+            
+            train_task = progress.add_task(
+                "[green]Training Episodes...", 
+                total=self.cfg.n_episodes
+            )
+            
+            for episode in range(self.cfg.n_episodes):
+                self.episode = episode
+                
+                # Reset buffers
+                for buffer in self.buffers.values():
+                    buffer.reset()
+                
+                # Run episode
+                episode_metrics = self._run_episode()
+                
+                # Update all networks with separate optimizers
+                loss_metrics = self._update_networks()
+                
+                # Calculate metrics
+                episode_reward = episode_metrics.get('episode_reward', 0.0)
+                pass_rate = 1.0 if episode_reward >= 0.99 else 0.0
+                
+                # Update best reward
+                if episode_reward > self.best_reward:
+                    self.best_reward = episode_reward
+                
+                # Logging
+                log_data = {
+                    "train/episode": episode,
+                    "train/episode_reward": episode_reward,
+                    "train/pass_rate": pass_rate,
+                    "train/episode_length": episode_metrics.get('episode_length', 0),
+                    "train/best_reward": self.best_reward,
+                }
+                
+                # Add all loss metrics
+                for k, v in loss_metrics.items():
+                    log_data[f"train/{k}"] = v
+                
+                wandb.log(log_data, step=episode)
+                
+                # Update progress bar
+                progress.update(
+                    train_task, 
+                    advance=1,
+                    description=f"[green]Episode {episode}: Reward={episode_reward:.3f}, Pass={pass_rate:.3f}"
+                )
+                
+                # Detailed logging with Rich
+                if episode % self.cfg.log_interval == 0:
+                    self._log_episode_details(episode, episode_reward, pass_rate, loss_metrics)
+                
+                # Save checkpoint
+                if episode > 0 and episode % self.cfg.save_interval == 0:
+                    self._save_checkpoint(episode)
+                    
+        self.console.print(Panel(
+            "[bold green]🎉 Training completed successfully![/bold green]\n"
+            f"• Total episodes: {self.cfg.n_episodes}\n"
+            f"• Best reward: {self.best_reward:.4f}",
+            title="Training Complete"
+        ))
+        wandb.finish()
+    
+    def _log_episode_details(self, episode: int, reward: float, pass_rate: float, losses: Dict[str, float]):
+        """Log detailed episode information with Rich tables"""
+        
+        # Create metrics table
+        table = Table(title=f"Episode {episode} Metrics")
+        table.add_column("Metric", style="cyan", no_wrap=True)
+        table.add_column("Value", style="magenta")
+        table.add_column("Type", style="green")
+        
+        # Add main metrics
+        table.add_row("Episode Reward", f"{reward:.4f}", "Performance")
+        table.add_row("Pass Rate", f"{pass_rate:.3f}", "Performance")
+        table.add_row("Best Reward", f"{self.best_reward:.4f}", "Performance")
+        
+        # Add loss metrics
+        actor_losses = {k: v for k, v in losses.items() if 'actor_loss' in k}
+        latent_losses = {k: v for k, v in losses.items() if 'latent_' in k}
+        other_losses = {k: v for k, v in losses.items() if k not in actor_losses and k not in latent_losses}
+        
+        for k, v in actor_losses.items():
+            table.add_row(k.replace('_', ' ').title(), f"{v:.6f}", "Actor Loss")
+        
+        for k, v in latent_losses.items():
+            table.add_row(k.replace('_', ' ').title(), f"{v:.6f}", "Latent Loss")
+            
+        for k, v in other_losses.items():
+            table.add_row(k.replace('_', ' ').title(), f"{v:.6f}", "Other Loss")
+        
+        self.console.print(table)
+        
+        # Performance indicator
+        if pass_rate >= 0.8:
+            status = "[bold green]🎯 Excellent Performance![/bold green]"
+        elif pass_rate >= 0.5:
+            status = "[yellow]⚡ Good Progress[/yellow]"
+        elif pass_rate >= 0.1:
+            status = "[orange3]🔄 Learning...[/orange3]"
+        else:
+            status = "[red]💪 Keep Training[/red]"
+        
+        self.console.print(Panel(status, title="Status"))
+        
+    def _save_checkpoint(self, episode):
+        """Save checkpoint with Rich logging"""
+        checkpoint = {
+            'episode': episode,
+            'actors': {role: actor.state_dict() for role, actor in self.actors.items()},
+            'critic': self.critic.state_dict(),
+            'inference_net': self.inference_net.state_dict(),
+            'obs_projection': self.obs_projection.state_dict(),
+            'llm': self.llm.model.state_dict(),  # Save LLM state too
+            'config': self.cfg,
+            'metrics': dict(self.metrics),
+            'best_reward': self.best_reward
+        }
+        
+        path = f"{self.cfg.checkpoint_dir}/checkpoint_{episode}.pt"
+        torch.save(checkpoint, path)
+        
+        self.console.print(f"[blue]💾 Checkpoint saved: {path}[/blue]")
 
-    def evaluate(self):
-        rewards = []
-        for _ in range(10):
-            self.collect_rollout()
-            rewards.append(self.last_rewards.mean().item())
-        avg_reward = sum(rewards) / len(rewards)
-        print(f"Eval average reward: {avg_reward}")
-        return avg_reward
+def main():
+    """Main training function with Rich interface"""
+    import argparse
     
-if __name__ == "__main__":
+    console = Console()
+    
+    parser = argparse.ArgumentParser(description="Complete SHPPO Training")
+    parser.add_argument("--episodes", type=int, default=100, help="Number of episodes")
+    parser.add_argument("--device", type=str, default="auto", help="Training device")
+    parser.add_argument("--wandb_project", type=str, default="shppo-complete", help="WandB project name")
+    parser.add_argument("--batch_size", type=int, default=4, help="Environment batch size")
+    args = parser.parse_args()
+    
+    # Create config
     config = SHPPOConfig()
-    trainer = SHPPOTrainer(config)
-    logger.info("SHPPO Trainer initialized successfully.")
+    config.n_episodes = args.episodes
+    config.wandb_project = args.wandb_project
+    config.env_config.batch_size = args.batch_size
     
-    # Example usage
+    if args.device != "auto":
+        config.device = args.device
+    
+    # Display startup info
+    console.print(Panel(
+        f"[bold cyan]Complete SHPPO Training[/bold cyan]\n"
+        f"• Episodes: {config.n_episodes}\n"
+        f"• Device: {config.device}\n"
+        f"• Batch Size: {config.env_config.batch_size}\n"
+        f"• LLM Training: Always Enabled 🔥\n"
+        f"• WandB Project: {config.wandb_project}",
+        title="🧠 Training Configuration"
+    ))
+    
+    # Create trainer
+    trainer = CompleteSHPPOTrainer(config)
     trainer.train()
-    trainer.evaluate()
-    logger.info("Training and evaluation completed.")
+    console.print("[bold green]✅ Training completed successfully![/bold green]")
+
+if __name__ == "__main__":
+    main()
