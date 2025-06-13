@@ -39,9 +39,10 @@ type_act = Dict[str, str]
 class SHPPOConfig:
     # Environment
     env_config: EnvConfig = field(default_factory=lambda: EnvConfig(
-        max_problems=512,
-        batch_size=64
+        # max_problems=512,
+        batch_size=128
     ))
+    env_type: str = "mixed_curriculum"  # Use the existing curriculum error environment
     
     # Model
     model_config: SHPPOModelConfig = field(default_factory=lambda: SHPPOModelConfig(
@@ -85,9 +86,6 @@ class SHPPOConfig:
     lambda_entropy: float = 0.01
     lambda_distance: float = 0.1
     
-    # Training Control - REMOVED update_llm choice
-    use_enhanced_generation: bool = True
-    
     # Logging
     log_interval: int = 5
     eval_interval: int = 20
@@ -117,7 +115,8 @@ class CompleteSHPPOTrainer:
         self._setup_logging()
         
         # Create environment using yy_env
-        self.env = create_env("curriculum_error", self.cfg.env_config)
+        # self.env = create_env("curriculum_error", self.cfg.env_config)
+        self.env = create_env(self.cfg.env_type, self.cfg.env_config)
         # Evaluation and test environments, with batch size set to training batch size
         self.eval_env = create_env(
             "curriculum_error",
@@ -263,6 +262,94 @@ class CompleteSHPPOTrainer:
             lambda_d=self.cfg.lambda_distance
         )
     
+    def _analyze_reward_distribution(self, rewards: List[float]) -> Dict[str, float]:
+        """Simple reward distribution analysis"""
+        if not rewards:
+            return {}
+        
+        total = len(rewards)
+        
+        # Count different reward types
+        positive_count = sum(1 for r in rewards if r > 0)
+        perfect_count = sum(1 for r in rewards if r >= 0.99)  # Perfect solutions
+        error_count = sum(1 for r in rewards if r < 0)        # Error rewards
+        zero_count = sum(1 for r in rewards if r == 0)        # Zero rewards
+        
+        return {
+            'positive_reward_ratio': positive_count / total,
+            'perfect_reward_ratio': perfect_count / total,
+            'error_reward_ratio': error_count / total,
+            'zero_reward_ratio': zero_count / total,
+            'avg_reward': sum(rewards) / total,
+        }
+
+    def _evaluate_simple_metrics(self, solutions: List[str], rewards: List[float]) -> Dict[str, float]:
+        """Simple evaluation metrics for test/eval"""
+        if not solutions or not rewards:
+            return {'pass_rate': 0.0, 'error_rate': 0.0}
+        
+        total = len(rewards)
+        pass_count = sum(1 for r in rewards if r >= 0.5)  # Consider >0.5 as pass
+        error_count = sum(1 for r in rewards if r < 0)    # Negative rewards as errors
+        
+        return {
+            'pass_rate': pass_count / total,
+            'error_rate': error_count / total,
+        }
+
+    def _compute_gradient_norms(self, model_params, model_name: str) -> float:
+        """Compute gradient norm for a given model's parameters"""
+        total_norm = 0
+        param_count = 0
+        
+        for p in model_params:
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+                param_count += 1
+        
+        if param_count > 0:
+            total_norm = total_norm ** (1. / 2)
+            return total_norm
+        else:
+            return 0.0
+
+    def _log_gradient_norms(self) -> Dict[str, float]:
+        """Log gradient norms for all model components"""
+        grad_norms = {}
+        
+        # 1. Actor gradient norms (per role)
+        for role, actor in self.actors.items():
+            grad_norm = self._compute_gradient_norms(actor.parameters(), f"{role}_actor")
+            grad_norms[f"{role}_actor_grad_norm"] = grad_norm
+            
+            # Separate encoder (latent) and head gradients
+            enc_grad_norm = self._compute_gradient_norms(actor.enc.parameters(), f"{role}_encoder")
+            head_grad_norm = self._compute_gradient_norms(actor.head.parameters(), f"{role}_head")
+            grad_norms[f"{role}_encoder_grad_norm"] = enc_grad_norm
+            grad_norms[f"{role}_head_grad_norm"] = head_grad_norm
+        
+        # 2. Critic gradient norms
+        critic_grad_norm = self._compute_gradient_norms(self.critic.parameters(), "critic")
+        grad_norms["critic_grad_norm"] = critic_grad_norm
+        
+        # 3. Inference network gradient norms
+        inference_grad_norm = self._compute_gradient_norms(self.inference_net.parameters(), "inference")
+        grad_norms["inference_grad_norm"] = inference_grad_norm
+        
+        # 4. Observation projection gradient norms
+        proj_grad_norm = self._compute_gradient_norms(self.obs_projection.parameters(), "obs_projection")
+        grad_norms["obs_projection_grad_norm"] = proj_grad_norm
+        
+        # 5. LLM gradient norms (LoRA parameters only)
+        if self.opt_llm is not None:
+            llm_params = self.llm.trainable_parameters()
+            if llm_params:
+                llm_grad_norm = self._compute_gradient_norms(llm_params, "llm")
+                grad_norms["llm_grad_norm"] = llm_grad_norm
+        
+        return grad_norms
+    
     def _embed_observation(self, obs: type_obs) -> torch.Tensor:
         """Embed observation using enhanced LLM"""
         role = obs["role"]
@@ -363,7 +450,7 @@ class CompleteSHPPOTrainer:
                 "batch_avg_reward": sum(rewards) / len(rewards),
                 "batch_pass_rate": sum(1 for r in rewards if r >= 0.5) / len(rewards),
                 "batch_avg_code_length": sum(len(code) for code in batch_solutions) / len(batch_solutions),
-                "batch_total_samples": len(batch_solutions)
+                # "batch_total_samples": len(batch_solutions)
             }, step=episode)
 
     def _log_role_based_samples(self, episode: int, workspace_history: List[Dict]):
@@ -417,11 +504,11 @@ class CompleteSHPPOTrainer:
             )
             wandb.log({
                 "role_based_table": role_table,
-                "total_roles": len(role_outputs)
+                # "total_roles": len(role_outputs)
             }, step=episode)
         
     def _run_episode(self) -> Dict[str, float]:
-        """Run one complete episode - MODIFIED to support logging"""
+        """Run one complete episode - MODIFIED to support reward distribution logging"""
         
         # Reset environment and get batch of problems
         obs_batch = self.env.reset_batch()
@@ -455,6 +542,7 @@ class CompleteSHPPOTrainer:
             episode_length += 3  # planner, coder, debugger
             self.step += 1
         torch.cuda.empty_cache()  # Clear cache after generating solutions
+        
         # Submit all solutions to environment at once
         rewards = self.env.step_batch(batch_solutions)
         assert len(rewards) == self.cfg.env_config.batch_size, \
@@ -468,6 +556,9 @@ class CompleteSHPPOTrainer:
         episode_reward = sum(rewards) / len(rewards)
         final_reward = episode_reward
         
+        # 📊 Analyze reward distribution
+        reward_distribution = self._analyze_reward_distribution(rewards)
+        
         # Distribute rewards to trajectories
         self._distribute_rewards_to_trajectories(rewards)
         torch.cuda.empty_cache()  # Clear cache after reward distribution
@@ -477,9 +568,9 @@ class CompleteSHPPOTrainer:
         
         return {
             "episode_reward": episode_reward,
-            "episode_length": episode_length,
             "final_reward": final_reward,
-            "latent_data": episode_latent_data
+            "latent_data": episode_latent_data,
+            "reward_distribution": reward_distribution,  # 새로 추가
         }
     
     def _generate_solution_for_problem(self, problem: Dict[str, Any], episode_latent_data: List) -> Tuple[str, Dict]:
@@ -699,7 +790,17 @@ class CompleteSHPPOTrainer:
                     # Update
                     optimizer.zero_grad()
                     final_loss.backward()
+                    
+                    # 🔥 LOG GRADIENT NORMS BEFORE CLIPPING
+                    pre_clip_grad_norm = self._compute_gradient_norms(actor.parameters(), f"{role}_actor")
+                    losses[f'{role}_actor_grad_norm_pre_clip'].append(pre_clip_grad_norm)
+                    
                     torch.nn.utils.clip_grad_norm_(actor.parameters(), self.cfg.max_grad_norm)
+                    
+                    # 🔥 LOG GRADIENT NORMS AFTER CLIPPING
+                    post_clip_grad_norm = self._compute_gradient_norms(actor.parameters(), f"{role}_actor")
+                    losses[f'{role}_actor_grad_norm_post_clip'].append(post_clip_grad_norm)
+                    
                     optimizer.step()
                     
                     losses[f'{role}_actor_loss'].append(total_actor_loss.item())
@@ -954,6 +1055,9 @@ class CompleteSHPPOTrainer:
                 # Update all networks with separate optimizers
                 loss_metrics = self._update_networks()
                 
+                # 🔥 LOG GRADIENT NORMS AFTER ALL UPDATES
+                grad_norms = self._log_gradient_norms()
+                
                 # Calculate metrics
                 episode_reward = episode_metrics.get('episode_reward', 0.0)
                 pass_rate = 1.0 if episode_reward >= 0.99 else 0.0
@@ -971,22 +1075,40 @@ class CompleteSHPPOTrainer:
                     "train/best_reward": self.best_reward,
                 }
                 
+                # 📊 Add reward distribution metrics
+                reward_dist = episode_metrics.get('reward_distribution', {})
+                for k, v in reward_dist.items():
+                    log_data[f"train/reward_{k}"] = v
+                
                 # Add all loss metrics
                 for k, v in loss_metrics.items():
+                    log_data[f"train/{k}"] = v
+                
+                # 🔥 ADD GRADIENT NORM METRICS
+                for k, v in grad_norms.items():
                     log_data[f"train/{k}"] = v
                 
                 wandb.log(log_data, step=episode)
 
                 # --- Validation ---
                 if episode % self.cfg.eval_interval == 0:
+                    self.eval_mode()  # Set to eval mode
+                    
                     val_batch = self.eval_env.reset_batch()
                     val_sols = []
                     for problem in val_batch:
                         sol, _ = self._generate_solution_for_problem(problem, [])
                         val_sols.append(sol)
                     val_rewards = self.eval_env.step_batch(val_sols)
-                    val_reward = sum(val_rewards) / len(val_rewards) if val_rewards else 0.0
-                    wandb.log({"eval/episode_reward": val_reward}, step=episode)
+                    
+                    # 📊 Simple eval metrics
+                    eval_metrics = self._evaluate_simple_metrics(val_sols, val_rewards)
+                    wandb.log({
+                        "eval/pass_rate": eval_metrics.get('pass_rate', 0.0),
+                        "eval/error_rate": eval_metrics.get('error_rate', 0.0),
+                    }, step=episode)
+                    
+                    self.train_mode()  # Back to train mode
                 
                 # Update progress bar
                 progress.update(
@@ -997,7 +1119,7 @@ class CompleteSHPPOTrainer:
                 
                 # Detailed logging with Rich
                 if episode % self.cfg.log_interval == 0:
-                    self._log_episode_details(episode, episode_reward, pass_rate, loss_metrics)
+                    self._log_episode_details(episode, episode_reward, pass_rate, loss_metrics, grad_norms)
                 
                 # Save checkpoint
                 if episode > 0 and episode % self.cfg.save_interval == 0:
@@ -1011,19 +1133,26 @@ class CompleteSHPPOTrainer:
         ))
 
         # --- Final test ---
+        self.eval_mode()
         test_batch = self.test_env.reset_batch()
         test_sols = []
         for problem in test_batch:
             sol, _ = self._generate_solution_for_problem(problem, [])
             test_sols.append(sol)
         test_rewards = self.test_env.step_batch(test_sols)
-        test_reward = sum(test_rewards) / len(test_rewards) if test_rewards else 0.0
-        self.console.print(f"[bold blue]🔍 Test Reward: {test_reward:.4f}[/bold blue]")
-        wandb.log({"test/episode_reward": test_reward})
+        
+        # 📊 Simple test metrics
+        test_metrics = self._evaluate_simple_metrics(test_sols, test_rewards)
+        self.console.print(f"[bold blue]🔍 Test Pass Rate: {test_metrics.get('pass_rate', 0.0):.4f}[/bold blue]")
+        self.console.print(f"[bold blue]🔍 Test Error Rate: {test_metrics.get('error_rate', 0.0):.4f}[/bold blue]")
+        wandb.log({
+            "test/pass_rate": test_metrics.get('pass_rate', 0.0),
+            "test/error_rate": test_metrics.get('error_rate', 0.0),
+        })
         wandb.finish()
     
-    def _log_episode_details(self, episode: int, reward: float, pass_rate: float, losses: Dict[str, float]):
-        """Log detailed episode information with Rich tables"""
+    def _log_episode_details(self, episode: int, reward: float, pass_rate: float, losses: Dict[str, float], grad_norms: Dict[str, float]):
+        """Log detailed episode information with Rich tables including gradient norms"""
         
         # Create metrics table
         table = Table(title=f"Episode {episode} Metrics")
@@ -1039,13 +1168,18 @@ class CompleteSHPPOTrainer:
         # Add loss metrics
         actor_losses = {k: v for k, v in losses.items() if 'actor_loss' in k}
         latent_losses = {k: v for k, v in losses.items() if 'latent_' in k}
-        other_losses = {k: v for k, v in losses.items() if k not in actor_losses and k not in latent_losses}
+        other_losses = {k: v for k, v in losses.items() 
+                       if k not in actor_losses and k not in latent_losses}
         
         for k, v in actor_losses.items():
             table.add_row(k.replace('_', ' ').title(), f"{v:.6f}", "Actor Loss")
         
         for k, v in latent_losses.items():
             table.add_row(k.replace('_', ' ').title(), f"{v:.6f}", "Latent Loss")
+        
+        # 🔥 ADD GRADIENT NORM SECTION
+        for k, v in grad_norms.items():
+            table.add_row(k.replace('_', ' ').title(), f"{v:.6f}", "Grad Norm")
             
         for k, v in other_losses.items():
             table.add_row(k.replace('_', ' ').title(), f"{v:.6f}", "Other Loss")

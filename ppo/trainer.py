@@ -90,7 +90,7 @@ class PPOConfig:
     seed: int = 42
     max_problem_length: int = 2048
     max_solution_length: int = 512
-    env_type: str = "curriculum_error"
+    env_type: str = "mixed_curriculum"  # "simple_error", "mixed_curriculum", etc.
     
     # NEW: Simple performance optimizations
     use_mixed_precision: bool = True     # Easy 30-50% speedup

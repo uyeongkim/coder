@@ -1,6 +1,7 @@
 """
 yy_env.py - Environment & Reward System
 성능 최적화: 병렬 처리, 캐싱, 메모리 관리
+HumanEval + CodeContest Mixed Curriculum Learning
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ import tempfile
 import subprocess
 import multiprocessing
 import random
+import ast
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -25,9 +27,9 @@ import logging
 from rich.logging import RichHandler
 
 
-# =═══════════════════════════════════════════════════════════════════════════logger, 
-# Set up rich logging
-# ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════
+# Logger Setup
+# ═══════════════════════════════════════════════════════════════════════════
 RICH_FORMAT = "%(message)s"
 
 logging.basicConfig(
@@ -35,8 +37,9 @@ logging.basicConfig(
     format=RICH_FORMAT,
     handlers=[RichHandler(rich_tracebacks=True)],
 )
-# Set up rich logging
+
 logger = logging.getLogger(__name__)
+
 def handle_exception(exc_type, exc_value, exc_traceback):
     if issubclass(exc_type, KeyboardInterrupt):
         sys.exit(0)
@@ -71,6 +74,7 @@ class RewardType(Enum):
 class EnvType(Enum):
     SIMPLE = "simple"
     CURRICULUM = "curriculum"
+    MIXED_CURRICULUM = "mixed_curriculum"  # HumanEval + CodeContest
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -114,7 +118,7 @@ class CodeContestDataset:
         self._load_dataset()
 
     def _load_dataset(self):
-        logger.info(f"🔄 Loading {self.cfg.split} dataset with optimizations...")
+        logger.info(f"🔄 Loading {self.cfg.split} CodeContest dataset with optimizations...")
         
         ds = load_dataset(
             "deepmind/code_contests",
@@ -136,7 +140,7 @@ class CodeContestDataset:
                 self.tasks.append(task)
         
         random.shuffle(self.tasks)
-        logger.info(f"✅ Loaded {len(self.tasks)} tasks")
+        logger.info(f"✅ Loaded {len(self.tasks)} CodeContest tasks")
 
     def _is_valid_task(self, row) -> bool:
         """Fast validation check"""
@@ -175,6 +179,7 @@ class CodeContestDataset:
                 "tests": tests,
                 "time_limit": float(tlim),
                 "cf_tags": row.get("cf_tags", []),
+                "dataset_type": "codecontest"
             }
             
             # Precompute test hashes if enabled
@@ -195,6 +200,78 @@ class CodeContestDataset:
         """Compute hash for task identification"""
         return hashlib.md5(task["name"].encode()).hexdigest()
 
+    def get_all_tasks(self) -> List[Dict[str, Any]]:
+        return self.tasks
+
+
+class HumanEvalDataset:
+    """HumanEval dataset loader for easier problems"""
+    
+    def __init__(self, cfg: EnvConfig):
+        self.cfg = cfg
+        self.tasks: List[Dict[str, Any]] = []
+        self._load_dataset()
+    
+    def _load_dataset(self):
+        logger.info(f"🔄 Loading HumanEval dataset...")
+        
+        try:
+            ds = load_dataset("openai_humaneval")["test"]
+            
+            for row in ds:
+                task = {
+                    "name": f"humaneval_{row['task_id']}",
+                    "description": row["prompt"],  # 함수 시그니처 + docstring
+                    "canonical_solution": row["canonical_solution"],
+                    "test": row["test"],  # assert statements
+                    "entry_point": row["entry_point"],  # function name
+                    "time_limit": 2.0,  # Default timeout
+                    "cf_tags": ["implementation"],  # Mark as easy for curriculum
+                    "dataset_type": "humaneval"
+                }
+                self.tasks.append(task)
+            
+            logger.info(f"✅ Loaded {len(self.tasks)} HumanEval tasks")
+            
+        except Exception as e:
+            logger.error(f"⚠️  Failed to load HumanEval: {e}")
+            self.tasks = []
+    
+    def get_all_tasks(self) -> List[Dict[str, Any]]:
+        return self.tasks
+
+
+class MixedDatasetLoader:
+    """Combines HumanEval and CodeContest datasets"""
+    
+    def __init__(self, cfg: EnvConfig):
+        self.cfg = cfg
+        self.humaneval_dataset = HumanEvalDataset(cfg)
+        self.codecontest_dataset = CodeContestDataset(cfg)
+        self.tasks: List[Dict[str, Any]] = []
+        self._combine_datasets()
+    
+    def _combine_datasets(self):
+        """Combine both datasets with priority to HumanEval for easier start"""
+        
+        # Get HumanEval tasks (mark as easy)
+        humaneval_tasks = self.humaneval_dataset.get_all_tasks()
+        for task in humaneval_tasks:
+            task["difficulty_score"] = 1  # Easiest
+            task["cf_tags"] = ["implementation", "easy"]  # Force easy classification
+        
+        # Get CodeContest tasks  
+        codecontest_tasks = self.codecontest_dataset.get_all_tasks()
+        for task in codecontest_tasks:
+            task["difficulty_score"] = 3  # Harder
+            if "dataset_type" not in task:
+                task["dataset_type"] = "codecontest"
+        
+        # Combine with HumanEval first for curriculum
+        self.tasks = humaneval_tasks + codecontest_tasks
+        
+        logger.info(f"✅ Combined datasets: {len(humaneval_tasks)} HumanEval + {len(codecontest_tasks)} CodeContest = {len(self.tasks)} total")
+    
     def get_all_tasks(self) -> List[Dict[str, Any]]:
         return self.tasks
 
@@ -426,6 +503,70 @@ class SimpleRewardCalculator(BaseRewardCalculator):
                     passed += 1
         
         return passed / len(tests)
+
+
+class HumanEvalRewardCalculator(BaseRewardCalculator):
+    """Dense reward calculator for HumanEval problems"""
+    
+    def __init__(self, use_parallel: bool = True, max_workers: int = None):
+        self.use_parallel = use_parallel
+        self.max_workers = max_workers
+    
+    def calculate_reward(self, task: Dict[str, Any], response: str) -> float:
+        """Calculate dense reward for HumanEval tasks"""
+        
+        if task.get("dataset_type") != "humaneval":
+            # Fallback to standard reward calculation for non-HumanEval tasks
+            return self._calculate_codecontest_reward(task, response)
+        
+        reward = 0.0
+        
+        # 1. Syntax check (0.2 points)
+        try:
+            ast.parse(response)
+            reward += 0.2
+        except SyntaxError:
+            return -0.3  # Syntax error penalty
+        
+        # 2. Function definition check (0.2 points)
+        entry_point = task.get("entry_point", "")
+        if entry_point and f"def {entry_point}(" in response:
+            reward += 0.2
+        elif "def " in response:  # Any function definition
+            reward += 0.1
+        
+        # 3. Basic execution test (0.2 points)
+        try:
+            exec(response)
+            reward += 0.2
+        except Exception:
+            return reward - 0.1  # Execution error but syntax OK
+        
+        # 4. Test execution (0.4 points)
+        try:
+            # Combine function code with test assertions
+            test_code = task.get("test", "")
+            if test_code:
+                full_code = response + "\n" + test_code
+                exec(full_code)
+                reward += 0.4  # All tests passed
+            else:
+                reward += 0.2  # No tests to run, partial credit
+                
+        except AssertionError:
+            # Function runs but tests fail
+            reward += 0.1
+        except Exception:
+            # Runtime error in tests
+            pass
+        
+        return min(reward, 1.0)  # Cap at 1.0
+    
+    def _calculate_codecontest_reward(self, task: Dict[str, Any], response: str) -> float:
+        """Fallback to CodeContest-style reward calculation"""
+        # Use existing SimpleRewardCalculator logic
+        simple_calc = SimpleRewardCalculator(self.use_parallel, self.max_workers)
+        return simple_calc.calculate_reward(task, response)
 
 
 class ErrorTypeRewardCalculator(BaseRewardCalculator):
@@ -779,6 +920,163 @@ class CurriculumManager:
         }
 
 
+class MixedCurriculumManager:
+    """Curriculum manager that prioritizes HumanEval then moves to CodeContest"""
+    
+    def __init__(self, problems: List[Dict[str, Any]], config: CurriculumConfig):
+        self.config = config
+        self.current_level = DifficultyLevel.EASY
+        self.episodes_at_current_level = 0
+        self.performance_history: List[Dict[str, float]] = []
+        
+        # Separate problems by dataset type and difficulty
+        self.problems_by_stage = self._categorize_problems_by_stage(problems)
+        
+        logger.info((
+            f"📚 Mixed Curriculum Learning initialized:\n"
+            f"  Stage 1 (HumanEval): {len(self.problems_by_stage['humaneval'])}\n"
+            f"  Stage 2 (CodeContest Easy): {len(self.problems_by_stage['codecontest_easy'])}\n"
+            f"  Stage 3 (CodeContest Medium): {len(self.problems_by_stage['codecontest_medium'])}\n"
+            f"  Stage 4 (CodeContest Hard): {len(self.problems_by_stage['codecontest_hard'])}\n"
+            f"  Starting with: HumanEval problems"
+        ))
+    
+    def _categorize_problems_by_stage(self, problems: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+        """Categorize problems into curriculum stages"""
+        
+        stages = {
+            'humaneval': [],
+            'codecontest_easy': [],
+            'codecontest_medium': [],
+            'codecontest_hard': []
+        }
+        
+        for problem in problems:
+            dataset_type = problem.get("dataset_type", "codecontest")
+            
+            if dataset_type == "humaneval":
+                stages['humaneval'].append(problem)
+            else:
+                # CodeContest problems - classify by tags
+                cf_tags = self._extract_tags(problem)
+                difficulty = self._classify_by_tags(cf_tags)
+                
+                if difficulty == DifficultyLevel.EASY:
+                    stages['codecontest_easy'].append(problem)
+                elif difficulty == DifficultyLevel.MEDIUM:
+                    stages['codecontest_medium'].append(problem)
+                else:
+                    stages['codecontest_hard'].append(problem)
+        
+        return stages
+    
+    def _extract_tags(self, problem: Dict[str, Any]) -> List[str]:
+        """Extract tags from problem"""
+        possible_fields = ["cf_tags", "tags", "cf_tag", "tag"]
+        
+        for field in possible_fields:
+            if field in problem and problem[field]:
+                tags = problem[field]
+                if isinstance(tags, list):
+                    return [str(tag).lower().strip() for tag in tags]
+                elif isinstance(tags, str):
+                    return [tag.strip().lower() for tag in tags.replace(',', ' ').split()]
+        return []
+    
+    def _classify_by_tags(self, tags: List[str]) -> DifficultyLevel:
+        """Classify CodeContest problems by tags"""
+        tags_set = set(tags)
+        
+        if tags_set.intersection(self.config.hard_tags):
+            return DifficultyLevel.HARD
+        elif tags_set.intersection(self.config.medium_tags):
+            return DifficultyLevel.MEDIUM
+        else:
+            return DifficultyLevel.EASY
+    
+    def get_current_problems(self) -> List[Dict[str, Any]]:
+        """Get problems for current stage"""
+        
+        # Stage progression: HumanEval -> CodeContest Easy -> Medium -> Hard
+        if self.episodes_at_current_level < 30:  # First 30 episodes: HumanEval only
+            current_problems = self.problems_by_stage['humaneval']
+            
+        elif self.episodes_at_current_level < 80:  # Episodes 30-80: Mix HumanEval + Easy CodeContest
+            humaneval_problems = self.problems_by_stage['humaneval']
+            easy_problems = self.problems_by_stage['codecontest_easy']
+            current_problems = humaneval_problems + easy_problems
+            
+        elif self.episodes_at_current_level < 150:  # Episodes 80-150: Easy + Medium CodeContest
+            easy_problems = self.problems_by_stage['codecontest_easy']
+            medium_problems = self.problems_by_stage['codecontest_medium']
+            current_problems = easy_problems + medium_problems
+            
+        else:  # Episodes 150+: All problems
+            current_problems = (
+                self.problems_by_stage['codecontest_easy'] + 
+                self.problems_by_stage['codecontest_medium'] + 
+                self.problems_by_stage['codecontest_hard']
+            )
+        
+        return current_problems if current_problems else self.problems_by_stage['humaneval']
+    
+    def record_performance(self, avg_reward: float, pass_rate: float):
+        """Record performance"""
+        self.episodes_at_current_level += 1
+        self.performance_history.append({
+            'level': self._get_current_stage_name(),
+            'episode': self.episodes_at_current_level,
+            'avg_reward': avg_reward,
+            'pass_rate': pass_rate
+        })
+    
+    def _get_current_stage_name(self) -> str:
+        """Get current stage name for logging"""
+        if self.episodes_at_current_level < 30:
+            return "humaneval_only"
+        elif self.episodes_at_current_level < 80:
+            return "humaneval_mixed"
+        elif self.episodes_at_current_level < 150:
+            return "codecontest_easy_medium"
+        else:
+            return "codecontest_all"
+    
+    def get_status(self) -> Dict[str, Any]:
+        """Get curriculum status"""
+        recent_episodes = self.performance_history[-20:] if len(self.performance_history) >= 20 else self.performance_history
+        
+        if recent_episodes:
+            recent_pass_rate = sum(ep['pass_rate'] for ep in recent_episodes) / len(recent_episodes)
+            recent_avg_reward = sum(ep['avg_reward'] for ep in recent_episodes) / len(recent_episodes)
+        else:
+            recent_pass_rate = 0.0
+            recent_avg_reward = -1.0
+        
+        current_problems = self.get_current_problems()
+        
+        return {
+            'curriculum_level': self._get_current_stage_name(),
+            'episodes_at_level': self.episodes_at_current_level,
+            'recent_pass_rate': recent_pass_rate,
+            'recent_avg_reward': recent_avg_reward,
+            'problems_at_level': len(current_problems),
+            'stage_description': self._get_stage_description()
+        }
+    
+    def _get_stage_description(self) -> str:
+        """Get description of current stage"""
+        stage_name = self._get_current_stage_name()
+        
+        descriptions = {
+            "humaneval_only": "Learning basics with HumanEval function completion",
+            "humaneval_mixed": "Mixing HumanEval with easy CodeContest problems", 
+            "codecontest_easy_medium": "Progressing through CodeContest easy/medium problems",
+            "codecontest_all": "Tackling full range of CodeContest problems"
+        }
+        
+        return descriptions.get(stage_name, "Unknown stage")
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 5. Environment Classes
 # ═══════════════════════════════════════════════════════════════════════════
@@ -917,6 +1215,72 @@ class CurriculumCodeEnv(BaseCodeEnv):
             }
 
 
+class MixedCurriculumCodeEnv(BaseCodeEnv):
+    """Environment that uses both HumanEval and CodeContest with curriculum"""
+    
+    def __init__(self, cfg: EnvConfig, reward_calculator: BaseRewardCalculator, 
+                 curriculum_config: CurriculumConfig = None):
+        
+        # Use mixed dataset instead of CodeContest only
+        self.cfg = cfg
+        self.reward_calculator = reward_calculator
+        self.dataset = MixedDatasetLoader(cfg).get_all_tasks()  # Mixed dataset
+        self.batch: List[Dict[str, Any]] = []
+        self.performance_history: List[float] = []
+        
+        # Setup mixed curriculum manager
+        if curriculum_config is None:
+            curriculum_config = CurriculumConfig(
+                # More relaxed thresholds for mixed curriculum
+                pass_rate_threshold=0.02,  # 2% pass rate to advance
+                avg_reward_threshold=-0.3,  # Average reward > -0.3
+                min_episodes_per_level=20,
+                eval_window_size=15
+            )
+        
+        self.curriculum_manager = MixedCurriculumManager(self.dataset, curriculum_config)
+        self.reset_batch()
+    
+    def reset_batch(self) -> List[Dict[str, Any]]:
+        """Sample batch from current curriculum stage"""
+        if not hasattr(self, 'curriculum_manager') or self.curriculum_manager is None:
+            # Fallback: random sampling
+            self.batch = random.sample(
+                self.dataset, 
+                min(self.cfg.batch_size, len(self.dataset))
+            )
+            return self.batch
+        
+        current_problems = self.curriculum_manager.get_current_problems()
+        
+        if not current_problems:
+            logger.warning(f"⚠️  No problems available for current stage, using all problems")
+            current_problems = self.dataset
+        
+        batch_size = min(self.cfg.batch_size, len(current_problems))
+        self.batch = random.sample(current_problems, batch_size)
+        return self.batch
+    
+    def record_episode_performance(self, avg_reward: float, pass_rate: float):
+        """Record performance for curriculum advancement"""
+        if hasattr(self, 'curriculum_manager') and self.curriculum_manager is not None:
+            self.curriculum_manager.record_performance(avg_reward, pass_rate)
+    
+    def get_curriculum_status(self) -> Dict[str, Any]:
+        """Get curriculum status"""
+        if hasattr(self, 'curriculum_manager') and self.curriculum_manager is not None:
+            return self.curriculum_manager.get_status()
+        else:
+            return {
+                'curriculum_level': 'mixed_unknown',
+                'episodes_at_level': 0,
+                'recent_pass_rate': 0.0,
+                'recent_avg_reward': -1.0,
+                'problems_at_level': len(self.dataset),
+                'stage_description': 'Mixed dataset without curriculum'
+            }
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 6. Environment Factory
 # ═══════════════════════════════════════════════════════════════════════════
@@ -926,16 +1290,21 @@ class EnvironmentFactory:
     @staticmethod
     def create_environment(env_type: EnvType, reward_type: RewardType, 
                           cfg: EnvConfig, curriculum_config: CurriculumConfig = None):
-        """
-        Create environment with specified type and reward calculator
-        """
+        """Create environment with specified type and reward calculator"""
         
-        # Create reward calculator with performance settings
+        # Create reward calculator
         if reward_type == RewardType.SIMPLE:
-            reward_calculator = SimpleRewardCalculator(
-                use_parallel=cfg.use_parallel_execution,
-                max_workers=cfg.max_workers
-            )
+            if env_type == EnvType.MIXED_CURRICULUM:
+                # Use HumanEval-aware reward calculator for mixed environment
+                reward_calculator = HumanEvalRewardCalculator(
+                    use_parallel=cfg.use_parallel_execution,
+                    max_workers=cfg.max_workers
+                )
+            else:
+                reward_calculator = SimpleRewardCalculator(
+                    use_parallel=cfg.use_parallel_execution,
+                    max_workers=cfg.max_workers
+                )
         elif reward_type == RewardType.ERROR_TYPE:
             reward_calculator = ErrorTypeRewardCalculator(
                 use_parallel=cfg.use_parallel_execution,
@@ -949,6 +1318,8 @@ class EnvironmentFactory:
             return SimpleCodeEnv(cfg, reward_calculator)
         elif env_type == EnvType.CURRICULUM:
             return CurriculumCodeEnv(cfg, reward_calculator, curriculum_config)
+        elif env_type == EnvType.MIXED_CURRICULUM:
+            return MixedCurriculumCodeEnv(cfg, reward_calculator, curriculum_config)
         else:
             raise ValueError(f"Unknown environment type: {env_type}")
 
@@ -958,13 +1329,14 @@ class EnvironmentFactory:
 # ═══════════════════════════════════════════════════════════════════════════
 def create_env(env_name: str, cfg: EnvConfig, curriculum_config: CurriculumConfig = None):
     """
-    Environment creation function with performance enhancements
+    Environment creation function with HumanEval + CodeContest mixed curriculum
     
     Available environments:
     - "simple_simple": Simple env + Simple reward
     - "simple_error": Simple env + Error-type reward
     - "curriculum_simple": Curriculum env + Simple reward  
     - "curriculum_error": Curriculum env + Error-type reward
+    - "mixed_curriculum": HumanEval + CodeContest curriculum (NEW!)
     """
     
     env_mapping = {
@@ -972,6 +1344,7 @@ def create_env(env_name: str, cfg: EnvConfig, curriculum_config: CurriculumConfi
         "simple_error": (EnvType.SIMPLE, RewardType.ERROR_TYPE),
         "curriculum_simple": (EnvType.CURRICULUM, RewardType.SIMPLE),
         "curriculum_error": (EnvType.CURRICULUM, RewardType.ERROR_TYPE),
+        "mixed_curriculum": (EnvType.MIXED_CURRICULUM, RewardType.SIMPLE),
     }
     
     if env_name not in env_mapping:
@@ -982,7 +1355,7 @@ def create_env(env_name: str, cfg: EnvConfig, curriculum_config: CurriculumConfi
     
     # Apply performance optimizations if not explicitly set
     if cfg.max_workers is None:
-        cfg.max_workers = min(multiprocessing.cpu_count() // 2, 8)  # Reasonable default
+        cfg.max_workers = min(multiprocessing.cpu_count() // 2, 8)
     
     return EnvironmentFactory.create_environment(env_type, reward_type, cfg, curriculum_config)
 
@@ -1009,3 +1382,52 @@ def create_optimized_env_config(
         cache_extracted_functions=True,
         precompute_test_hashes=False  # Skip for speed
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 8. Usage Example
+# ═══════════════════════════════════════════════════════════════════════════
+def example_usage():
+    """Example of using the new mixed curriculum environment"""
+    
+    # Create config
+    cfg = EnvConfig(
+        batch_size=32,
+        max_problems=1000,  # Reduced for faster loading
+        split="train"
+    )
+    
+    # Create mixed curriculum environment
+    env = create_env("mixed_curriculum", cfg)
+    
+    # Check initial curriculum status
+    status = env.get_curriculum_status()
+    print(f"Starting stage: {status['stage_description']}")
+    print(f"Problems available: {status['problems_at_level']}")
+    
+    # Simulate training loop
+    for episode in range(10):
+        # Reset and get problems
+        problems = env.reset_batch()
+        
+        # Dummy solutions
+        solutions = ["def solution(): return 42"] * len(problems)
+        
+        # Get rewards
+        rewards = env.step_batch(solutions)
+        
+        # Record performance
+        avg_reward = sum(rewards) / len(rewards)
+        pass_rate = sum(1 for r in rewards if r >= 0.5) / len(rewards)
+        env.record_episode_performance(avg_reward, pass_rate)
+        
+        print(f"Episode {episode}: Avg reward = {avg_reward:.3f}, Pass rate = {pass_rate:.3f}")
+        
+        # Check curriculum status every few episodes
+        if episode % 5 == 0:
+            status = env.get_curriculum_status()
+            print(f"  Current stage: {status['stage_description']}")
+
+
+if __name__ == "__main__":
+    example_usage()
