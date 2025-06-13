@@ -146,19 +146,17 @@ class MultiHeadCritic(nn.Module):
 
 # ══════════════════ 3. Enhanced Inference Network (Scalable) ══════════════════
 class ScalableInferenceNet(nn.Module):
-    """Scalable InferenceNet that handles variable number of agents using attention"""
+    """FIXED: Scalable InferenceNet with correct dimension handling"""
     
     def __init__(self, cfg: SHPPOModelConfig):
         super().__init__()
         self.latent_dim = cfg.latent_dim
         self.hidden_dim = cfg.mlp_hidden_dim
         
-        # Agent feature encoder (processes mu + sigma for each agent)
-        self.agent_encoder = nn.Sequential(
-            nn.Linear(self.latent_dim * 2, self.hidden_dim),
-            nn.ReLU(),
-            nn.Linear(self.hidden_dim, self.hidden_dim)
-        )
+        # FIXED: Agent feature encoder should handle the actual input dimension
+        # Input will be [batch_size, 1, n_templates * latent_dim * 2]
+        # We need to calculate the actual input dimension dynamically
+        self.expected_agent_feature_dim = None  # Will be set during first forward pass
         
         # Multi-head attention for scalable aggregation
         self.attention = nn.MultiheadAttention(
@@ -190,22 +188,39 @@ class ScalableInferenceNet(nn.Module):
             nn.init.orthogonal_(module.weight, math.sqrt(2))
             nn.init.zeros_(module.bias)
     
+    def _create_agent_encoder(self, input_dim: int):
+        """Create agent encoder with correct input dimension"""
+        self.agent_encoder = nn.Sequential(
+            nn.Linear(input_dim, self.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim)
+        )
+        self.agent_encoder.apply(self._init_weights)
+    
     def forward(
         self,
         agent_latent_features: torch.Tensor,  # [batch_size, n_agents, feature_dim]
         global_obs: torch.Tensor  # [batch_size, global_obs_dim]
     ) -> torch.Tensor:
         """
-        Forward pass with attention-based aggregation for scalability
+        FIXED: Forward pass with dynamic dimension handling
         
         Args:
-            agent_latent_features: [batch_size, n_agents, latent_dim*2] (mu+sigma concatenated)
+            agent_latent_features: [batch_size, n_agents, feature_dim]
             global_obs: [batch_size, global_obs_dim]
         Returns:
             value: [batch_size] - predicted value for the team
         """
         batch_size = global_obs.size(0)
         n_agents = agent_latent_features.size(1)
+        feature_dim = agent_latent_features.size(2)
+        
+        # Create agent encoder if not exists or dimension changed
+        if not hasattr(self, 'agent_encoder') or self.expected_agent_feature_dim != feature_dim:
+            self.expected_agent_feature_dim = feature_dim
+            self._create_agent_encoder(feature_dim)
+            # Move to same device as input
+            self.agent_encoder = self.agent_encoder.to(agent_latent_features.device)
         
         # Encode each agent's latent features: [batch_size, n_agents, hidden_dim]
         agent_encoded = self.agent_encoder(agent_latent_features)

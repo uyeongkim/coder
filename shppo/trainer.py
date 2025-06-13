@@ -92,7 +92,7 @@ class SHPPOConfig:
     log_interval: int = 5
     eval_interval: int = 20
     save_interval: int = 50
-    checkpoint_dir: str = "./checkpoints_complete"
+    checkpoint_dir: str = "/data/checkpoints"
     wandb_project: str = "shppo"
     wandb_run_name: Optional[str] = None
     
@@ -330,7 +330,7 @@ class CompleteSHPPOTrainer:
         batch_solutions = []
         
         for batch_idx, problem in enumerate(obs_batch):
-            self.console.print(f"[blue]🔧 Processing problem {batch_idx + 1}/{len(obs_batch)}: {problem.get('name', 'Unknown')}[/blue]")
+            # self.console.print(f"[blue]🔧 Processing problem {batch_idx + 1}/{len(obs_batch)}: {problem.get('name', 'Unknown')}[/blue]")
             
             # Generate solution for this problem using multi-agent workflow
             solution = self._generate_solution_for_problem(problem, episode_latent_data)
@@ -360,7 +360,7 @@ class CompleteSHPPOTrainer:
         }
     
     def _generate_solution_for_problem(self, problem: Dict[str, Any], episode_latent_data: List) -> str:
-        """Generate solution for a single problem using multi-agent workflow"""
+        """Generate solution for a single problem using multi-agent workflow - FIXED"""
         
         # Initialize problem workspace
         workspace = {
@@ -371,7 +371,7 @@ class CompleteSHPPOTrainer:
         
         # Multi-agent workflow: planner -> coder -> debugger
         roles_sequence = ["planner", "coder", "debugger"]
-        device = torch.device(self.cfg.device)  # FIXED: Get device
+        device = torch.device(self.cfg.device)
         
         for role in roles_sequence:
             # Create role-specific observation
@@ -400,29 +400,29 @@ class CompleteSHPPOTrainer:
                 
             workspace["visible_files"][filename] = content
             
-            # Store trajectory for this role - FIXED: Ensure all tensors are on same device
+            # Store trajectory for this role - FIXED: Use detach() to prevent gradient tracking
             traj = Trajectory(
-                state=obs_emb.squeeze(0).to(device),
-                latent=action_data['latent'].squeeze(0).to(device),
-                action=torch.tensor(action_data['action'], device=device),  # FIXED: Specify device
-                logp=action_data['logprob'].to(device),
-                reward=torch.tensor(0.0, device=device),  # FIXED: Specify device
-                value=action_data['value'].to(device)
+                state=obs_emb.squeeze(0).detach().to(device),
+                latent=action_data['latent'].squeeze(0).detach().to(device),
+                action=torch.tensor(action_data['action'], device=device),
+                logp=action_data['logprob'].detach().to(device),
+                reward=torch.tensor(0.0, device=device),
+                value=action_data['value'].detach().to(device)
             )
             
-            # Store additional data for complete loss computation - FIXED: Ensure device consistency
-            traj.mu = action_data['mu'].squeeze(0).to(device)
-            traj.sigma = action_data['sigma'].squeeze(0).to(device)
-            traj.obs_emb = obs_emb.squeeze(0).to(device)
+            # Store additional data for complete loss computation - FIXED: Use detach()
+            traj.mu = action_data['mu'].squeeze(0).detach().to(device)
+            traj.sigma = action_data['sigma'].squeeze(0).detach().to(device)
+            traj.obs_emb = obs_emb.squeeze(0).detach().to(device)
             
             self.buffers[role].add(traj)
             
             episode_latent_data.append({
                 'role': role,
-                'mu': action_data['mu'].to(device),
-                'sigma': action_data['sigma'].to(device),
-                'latent': action_data['latent'].to(device),
-                'obs_emb': obs_emb.to(device)
+                'mu': action_data['mu'].detach().to(device),
+                'sigma': action_data['sigma'].detach().to(device),
+                'latent': action_data['latent'].detach().to(device),
+                'obs_emb': obs_emb.detach().to(device)
             })
         
         # Return the final code solution
@@ -513,9 +513,9 @@ class CompleteSHPPOTrainer:
         return {k: sum(v) / len(v) if v else 0.0 for k, v in total_losses.items()}
         
     def _update_actors(self) -> Dict[str, List[float]]:
-        """Update actor networks with PPO loss"""
+        """Update actor networks with PPO loss - FIXED: Avoid in-place operations"""
         losses = defaultdict(list)
-        device = torch.device(self.cfg.device)  # FIXED: Get device
+        device = torch.device(self.cfg.device)
         
         for role, buffer in self.buffers.items():
             if len(buffer.traj) == 0:
@@ -536,17 +536,17 @@ class CompleteSHPPOTrainer:
                 batch_entropies = []
                 
                 for traj in batch:
-                    # Forward pass - FIXED: Ensure all tensors are on same device
-                    state = traj.state.unsqueeze(0).to(device)
-                    latent = traj.latent.unsqueeze(0).to(device)
-                    action = traj.action.unsqueeze(0).to(device)  # FIXED: Ensure action is on device
-                    old_logprob = traj.logp.to(device)
-                    advantages = traj.advs.to(device)
+                    # FIXED: Create new tensors instead of reusing trajectory tensors
+                    # This prevents in-place operations on the same tensor
+                    state = traj.state.detach().clone().unsqueeze(0).to(device)
+                    action = traj.action.detach().clone().unsqueeze(0).to(device)
+                    old_logprob = traj.logp.detach().clone().to(device)
+                    advantages = traj.advs.detach().clone().to(device)
                     
                     # Actor forward (no gradient to latent part)
                     with torch.no_grad():
-                        mu = traj.mu.unsqueeze(0).to(device)
-                        sigma = traj.sigma.unsqueeze(0).to(device)
+                        mu = traj.mu.detach().clone().unsqueeze(0).to(device)
+                        sigma = traj.sigma.detach().clone().unsqueeze(0).to(device)
                         latent_no_grad = mu + sigma * torch.randn_like(sigma)
                     
                     # Only update actor head, not encoder
@@ -555,7 +555,7 @@ class CompleteSHPPOTrainer:
                     # Policy loss
                     probs = F.softmax(logits, dim=-1)
                     dist = torch.distributions.Categorical(probs)
-                    new_logprob = dist.log_prob(action).squeeze()  # Now both tensors are on same device
+                    new_logprob = dist.log_prob(action).squeeze()
                     entropy = dist.entropy().squeeze()
                     
                     # PPO clipped loss
@@ -583,21 +583,21 @@ class CompleteSHPPOTrainer:
                     losses[f'{role}_entropy'].append(total_entropy.item())
         
         return losses
-    
+
     def _update_critic(self) -> Dict[str, List[float]]:
-        """Update critic network"""
+        """Update critic network - FIXED: Avoid in-place operations"""
         losses = defaultdict(list)
-        device = torch.device(self.cfg.device)  # FIXED: Get device
+        device = torch.device(self.cfg.device)
         
         all_states = []
         all_returns = []
         all_roles = []
         
-        # Collect all data
+        # Collect all data - FIXED: Use detach().clone() to avoid in-place issues
         for role, buffer in self.buffers.items():
             for traj in buffer.traj:
-                all_states.append(traj.obs_emb.to(device))  # FIXED: Ensure device
-                all_returns.append(traj.returns.to(device))  # FIXED: Ensure device
+                all_states.append(traj.obs_emb.detach().clone().to(device))
+                all_returns.append(traj.returns.detach().clone().to(device))
                 all_roles.append(role)
         
         if not all_states:
@@ -636,11 +636,11 @@ class CompleteSHPPOTrainer:
             self.opt_critic.step()
         
         return losses
-    
+
     def _update_latent_networks(self) -> Dict[str, List[float]]:
-        """Update latent networks with complete SHPPO losses"""
+        """FIXED: Update latent networks with correct tensor shapes"""
         losses = defaultdict(list)
-        device = torch.device(self.cfg.device)  # FIXED: Get device
+        device = torch.device(self.cfg.device)
         
         # Collect latent data from all roles
         all_mu = []
@@ -650,29 +650,31 @@ class CompleteSHPPOTrainer:
         
         for role, buffer in self.buffers.items():
             for traj in buffer.traj:
-                all_mu.append(traj.mu.to(device))  # FIXED: Ensure device
-                all_sigma.append(traj.sigma.to(device))  # FIXED: Ensure device
-                all_latent.append(traj.latent.to(device))  # FIXED: Ensure device
-                all_obs_emb.append(traj.obs_emb.to(device))  # FIXED: Ensure device
+                all_mu.append(traj.mu.detach().clone().to(device))
+                all_sigma.append(traj.sigma.detach().clone().to(device))
+                all_latent.append(traj.latent.detach().clone().to(device))
+                all_obs_emb.append(traj.obs_emb.detach().clone().to(device))
         
         if not all_mu:
             return losses
         
         # Stack tensors
-        mu_batch = torch.stack(all_mu)
-        sigma_batch = torch.stack(all_sigma)
+        mu_batch = torch.stack(all_mu)        # [batch_size, n_templates, latent_dim]
+        sigma_batch = torch.stack(all_sigma)  # [batch_size, n_templates, latent_dim]
         latent_batch = torch.stack(all_latent)
         obs_batch = torch.stack(all_obs_emb)
         
-        # Compute inference network value
+        
+        # FIXED: Prepare agent features correctly
         batch_size = mu_batch.size(0)
         n_templates = mu_batch.size(1)
         latent_dim = mu_batch.size(2)
         
         # Combine mu and sigma: [batch_size, n_templates, latent_dim*2]
         agent_features = torch.cat([mu_batch, sigma_batch], dim=-1)
-        # Treat each sample as single agent: [batch_size, 1, features]
-        agent_features = agent_features.view(batch_size, 1, -1)
+        
+        # FIXED: Don't reshape - keep as [batch_size, n_templates, latent_dim*2]
+        # The inference network will handle multiple agents (templates) properly
         
         inference_value = self.inference_net(agent_features, obs_batch)
         
@@ -701,11 +703,11 @@ class CompleteSHPPOTrainer:
             losses[f'latent_{k}'].append(v.item())
         
         return losses
-    
+
     def _update_inference_network(self) -> Dict[str, List[float]]:
-        """Update inference network with MSE loss"""
+        """FIXED: Update inference network with correct tensor shapes"""
         losses = defaultdict(list)
-        device = torch.device(self.cfg.device)  # FIXED: Get device
+        device = torch.device(self.cfg.device)
         
         # Collect data
         all_mu = []
@@ -715,10 +717,10 @@ class CompleteSHPPOTrainer:
         
         for role, buffer in self.buffers.items():
             for traj in buffer.traj:
-                all_mu.append(traj.mu.to(device))  # FIXED: Ensure device
-                all_sigma.append(traj.sigma.to(device))  # FIXED: Ensure device
-                all_obs_emb.append(traj.obs_emb.to(device))  # FIXED: Ensure device
-                all_returns.append(traj.returns.to(device))  # FIXED: Ensure device
+                all_mu.append(traj.mu.detach().clone().to(device))
+                all_sigma.append(traj.sigma.detach().clone().to(device))
+                all_obs_emb.append(traj.obs_emb.detach().clone().to(device))
+                all_returns.append(traj.returns.detach().clone().to(device))
         
         if not all_mu:
             return losses
@@ -729,10 +731,9 @@ class CompleteSHPPOTrainer:
         obs_batch = torch.stack(all_obs_emb)
         returns_batch = torch.stack(all_returns)
         
-        # Prepare for inference net
-        batch_size = mu_batch.size(0)
+        # FIXED: Prepare for inference net with correct dimensions
         agent_features = torch.cat([mu_batch, sigma_batch], dim=-1)
-        agent_features = agent_features.view(batch_size, 1, -1)
+        # Keep as [batch_size, n_templates, latent_dim*2] - don't reshape
         
         # Forward pass
         predicted_values = self.inference_net(agent_features, obs_batch)
@@ -749,40 +750,51 @@ class CompleteSHPPOTrainer:
         losses['inference_mse_loss'].append(inference_loss.item())
         
         return losses
-    
+
     def _update_llm(self) -> Dict[str, List[float]]:
-        """Update LLM parameters"""
+        """BEST FIX: Update LLM parameters with proper gradient tracking"""
         losses = defaultdict(list)
-        device = torch.device(self.cfg.device)  # FIXED: Get device
+        device = torch.device(self.cfg.device)
         
-        # Collect some recent observations for LLM training
-        recent_obs = []
-        for role, buffer in self.buffers.items():
-            if buffer.traj:
-                # Take last observation as example
-                recent_obs.append(buffer.traj[-1].obs_emb.to(device))  # FIXED: Ensure device
+        # Skip LLM update if no trajectories
+        if not any(len(buffer.traj) > 0 for buffer in self.buffers.values()):
+            return losses
         
-        if recent_obs:
-            # Simple loss: encourage diverse embeddings
-            obs_stack = torch.stack(recent_obs)
-            
-            # Compute variance loss (encourage diversity)
-            variance = torch.var(obs_stack, dim=0).mean()
-            diversity_loss = -variance  # Negative to maximize variance
-            
-            # Update LLM
-            self.opt_llm.zero_grad()
-            diversity_loss.backward()
-            
-            # Clip gradients for LoRA parameters
-            llm_params = self.llm.trainable_parameters()
-            if llm_params:
-                torch.nn.utils.clip_grad_norm_(llm_params, self.cfg.max_grad_norm)
-            
-            self.opt_llm.step()
-            
-            losses['llm_diversity_loss'].append(diversity_loss.item())
+        # Generate new embeddings with gradients for LLM training
+        sample_prompts = []
+        for role in ["planner", "coder", "debugger"]:
+            sample_prompts.append(f"Role: {role}\n\nAnalyze and generate code solution")
         
+        # Create fresh embeddings with gradient tracking
+        raw_embeddings = self.llm.embed_observation_with_gradient(
+            sample_prompts,
+            allow_grad=True  # Essential for LLM parameter updates
+        )
+        
+        # Project to RL embedding space
+        projected_embeddings = self.obs_projection(raw_embeddings)
+        
+        # Compute diversity loss to encourage varied representations
+        if projected_embeddings.size(0) > 1:
+            # Use standard deviation as diversity measure
+            std_dev = torch.std(projected_embeddings, dim=0).mean()
+            diversity_loss = -std_dev  # Maximize diversity
+        else:
+            # Single sample: use L2 regularization
+            diversity_loss = torch.mean(projected_embeddings ** 2) * 0.01
+        
+        # Update LLM LoRA parameters
+        self.opt_llm.zero_grad()
+        diversity_loss.backward()
+        
+        # Clip gradients
+        llm_params = self.llm.trainable_parameters()
+        if llm_params:
+            torch.nn.utils.clip_grad_norm_(llm_params, self.cfg.max_grad_norm)
+        
+        self.opt_llm.step()
+        
+        losses['llm_diversity_loss'].append(diversity_loss.item())
         return losses
         
     def train(self):
