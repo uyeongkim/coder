@@ -1,4 +1,7 @@
-# Multi-Agent Coding Agent with PPO & SHPPO
+# MARCOG: Multi-Agent Reinforcement for Code Generation
+
+This is an ongoing project titled **MARCOG: Multi-Agent Reinforcement for Code Generation**, developed by [Yuyeong Kim](https://yuyeong-kim.notion.site) and [Junyoung Son](https://linkedin.com/in/junyoung-son-ab258625b).
+
 
 This repository implements a multi-agent system for code generation, built on top of a Qwen LLM and fine-tuned via LoRA. It includes two RL strategies:
 
