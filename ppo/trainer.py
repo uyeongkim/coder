@@ -20,7 +20,7 @@ from transformers import get_cosine_schedule_with_warmup
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(ROOT_DIR)
 
-from yy_env import (
+from env import (
     create_env,
     EnvConfig, 
     CurriculumConfig,

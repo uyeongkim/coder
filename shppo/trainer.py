@@ -21,8 +21,7 @@ import wandb
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(ROOT_DIR)
 
-# 기존 yy_env.py 사용 (완성된 환경)
-from yy_env import (
+from env import (
     EnvConfig, create_env
 )
 from shppo.model import (
@@ -114,7 +113,7 @@ class CompleteSHPPOTrainer:
         # Setup
         self._setup_logging()
         
-        # Create environment using yy_env
+        # Create environment using env
         # self.env = create_env("curriculum_error", self.cfg.env_config)
         self.env = create_env(self.cfg.env_type, self.cfg.env_config)
         # Evaluation and test environments, with batch size set to training batch size

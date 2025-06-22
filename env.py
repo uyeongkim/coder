@@ -1,5 +1,5 @@
 """
-yy_env.py - Environment & Reward System
+env.py - Environment & Reward System
 성능 최적화: 병렬 처리, 캐싱, 메모리 관리
 HumanEval + CodeContest Mixed Curriculum Learning
 """
